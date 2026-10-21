@@ -29,8 +29,8 @@ Python tools, was rewritten with assistance from **DeepSeek**.
 ## Build
 
 ```sh
-source CoherentSearch_C/bashrc
-cd CoherentSearch_C/CoherentSearch_C
+source ~/bashrc
+cd CoherentSearch_C
 make            # CPU-only binary (GPU=0, the default)
 make GPU=1      # also build the CUDA/cuFFT backend
 ```
