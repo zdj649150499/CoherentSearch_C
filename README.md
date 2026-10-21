@@ -345,33 +345,39 @@ on the tests above.
 
 ## Performance
 
-Heavy configuration: `-n 120 --maxdecim 16 -t 8`, 2,255 chunks,
-4.6 M trial fundamentals; wall clock after the FFTW wisdom cache is warm
-(no GPU used, Ryzen 9 9950X):
+Benchmark host: AMD Ryzen 9 9950X (32 logical CPUs), RTX 4080 SUPER, CUDA 12,
+FFTW 3.3.10, Julia 1.13.1.  Timings are wall clock, with `--noprogress`, and
+write their candidate files to `/tmp`.
+
+Heavy configuration: `-n 120 --maxdecim 16 -t 8` on a single 12.4 MB,
+T = 305.3 s FFT: 4,548 chunks, 9.15 M trial fundamentals.  Wall clock after
+the FFTW wisdom cache is warm (no GPU used):
 
 | threads | C | Julia |
 |---:|---:|---:|
-| 1 | 8.7 s | 9.4 s |
-| 4 | 2.37 s | 2.94 s |
-| 8 | **1.59 s** | 2.22 s |
-| 16 | 2.07 s | 2.76 s |
-| 32 | 3.49 s | 4.07 s |
+| 1 | 8.56 s | 9.19 s |
+| 4 | 2.31 s | 2.90 s |
+| 8 | **1.63 s** | 2.35 s |
+| 16 | 2.20 s | 2.94 s |
+| 32 | 3.48 s | 4.24 s |
 
-105-file DM list from `test_data/test` (`--numharm 32 -t 5.5 --maxdecim 16`,
-including the internal FFT/rednoise for every `.dat`):
+105-file DM sweep from `test_data/test` (`--numharm 32 -t 5.5 --maxdecim 16`).
+C rows use the 105 `.dat` files and include the internal realfft/rednoise;
+Julia rows use the corresponding `_red.fft` files (Julia has no in-memory
+`.dat` path):
 
 | run | wall | notes |
 |---|---:|---|
-| Single `.fft`, C default (1 thread) | 2.06 s | one core per process |
-| Single `.fft`, C `--threads 16` | **0.24 s** | vs Julia 1.19 s |
-| C CPU, 105-file list, default (1 thread) | ~3.6 min | intended for batch mode |
-| C CPU, 105-file list, `--threads 14` | **23.0 s** | ~200 MB RSS |
-| C CPU, 105-file list, `--threads 8` | 29.5 s | memory-bandwidth limited |
+| Single `.fft`, C default (1 thread) | 2.05 s | one core per process |
+| Single `.fft`, C `--threads 16` | **0.27 s** | Julia `-t auto` 1.20 s; Julia `-t 16` 0.92 s |
+| C CPU, 105-file list, default (1 thread) | 216 s (3.6 min) | intended for batch mode |
+| C CPU, 105-file list, `--threads 14` | **23.7 s** | ~200 MB RSS |
+| C CPU, 105-file list, `--threads 8` | 30.2 s | memory-bandwidth limited |
 | C CPU, 105-file list, 12 processes × `-t 1` | 30.1 s | ~65 MB RSS each |
-| C CPU, 105-file list, 16 processes × `-t 1` | 36.0 s | memory-bandwidth bound |
-| C GPU, 105-file list | **7.0 s** | ~250 MB RSS, one shared context |
-| Julia CPU, single file / 105-file list | 1.19 s / 59.7 s | Julia includes startup |
-| Julia GPU, 105-file list | 20.5 s | includes CUDA.jl loading |
+| C CPU, 105-file list, 16 processes × `-t 1` | 38.1 s | memory-bandwidth bound |
+| C GPU, 105-file list | **7.05 s** | ~250 MB RSS, one shared context |
+| Julia CPU, single file / 105-file list | 1.20 s / 62.6 s | Julia `-t auto`, includes startup |
+| Julia GPU, 105-file list | 19.5 s | includes CUDA.jl loading |
 
 The default one thread keeps a process-per-file scheduler predictable.
 Multi-process runs are limited by memory bandwidth on this host: 12
@@ -388,14 +394,14 @@ comparisons, lower it for speed.
 Per-file `realfft`+`rednoise` in memory costs about 0.05 s.  When a CPU process
 has more than one search thread (or when running on the GPU), the list driver
 runs two prefetch producer threads over a four-slot buffer, hiding that work
-behind the search (observed as 34 -> 23.0 s CPU with 14 threads, and
-18.4 -> 7.0 s on the GPU, for the 105-file list).
+behind the search: the 105-file list takes 23.7 s with 14 CPU threads and
+7.05 s on the GPU.
 
 Further optimisations in this version:
 
 - GPU metric kernels append only above-threshold candidates to compact record
   buffers with atomics, so the host no longer scans/copies ~73 million metrics
-  per file (105-file GPU run: 18.4 -> 7.0 s);
+  per file (105-file GPU run: 18.4 -> 7.05 s);
 - candidate records are written straight into mapped pinned host memory; each
   GPU chunk uses one blocking count copy as its completion point, with no
   explicit stream synchronization and no record device-to-host copies;
@@ -419,22 +425,24 @@ compiler's intrinsics (22.8 s vs 26.8 s on the 105-file list), so it was removed
 the C kernels already compile to the expected `zmm`/`ymm` loads, `vmaxps` and
 FMA sequences and GCC schedules them better than the hand-written loop.
 
-GPU (RTX 4080 SUPER, default 65536-trial chunks; the ~0.8 s context + cuFFT
-plan setup is included):
+GPU (same 12.4 MB FFT, `-t 8`, default 65536-trial chunks; CUDA context and
+cuFFT plan setup included):
 
 | workload | CPU 8 threads | GPU | Julia GPU (end to end) |
 |---|---:|---:|---:|
-| `-n 60 --maxdecim 16` | 0.6 s | 1.25 s | 9.7 s |
-| `-n 120 --maxdecim 16` | 1.59 s | 1.25 s | 9.7 s |
-| `-n 240 --maxdecim 16` | 12.46 s | **3.61 s** | — |
+| `-n 60 --maxdecim 16` | 0.29 s | **0.12 s** | 8.4 s |
+| `-n 120 --maxdecim 16` | 1.63 s | **0.52 s** | 8.4 s |
+| `-n 240 --maxdecim 16` | 9.57 s | **2.36 s** | — |
 
-The GPU wins once the search itself dominates the fixed setup cost (large
-harmonic counts or long bands); at small sizes the CPU path's zero start-up is
-faster.  Julia's figures include CUDA.jl loading, which dominates its 9.7 s.
+The C GPU fixed setup is about 0.1 s here because this host runs a CUDA MPS
+server; earlier cold-context runs included about 0.8 s and were slower than the
+CPU for `-n 60`.  Julia's figures are dominated by CUDA.jl loading (~8 s); on
+this MPS-enabled host Julia was run with `JULIA_CUDA_USE_COMPAT=false` so it
+selects the system driver.
 
-Single-thread phase totals (heavy config): interpolation 1.20 s, base inverse
-FFT 0.87 s, base metric 0.82 s, decimated inverse FFTs 3.47 s, decimated metrics
-1.81 s — against Julia's 1.17 / 1.05 / 0.83 / 3.63 / 1.81 s.
+Single-thread phase totals (heavy config): interpolation 1.30 s, base inverse
+FFT 0.87 s, base metric 0.79 s, decimated inverse FFTs 3.51 s, decimated metrics
+1.68 s — against Julia's 1.17 / 1.05 / 0.83 / 3.63 / 1.81 s.
 
 The original CPU optimisations that got there:
 
