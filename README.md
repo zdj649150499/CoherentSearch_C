@@ -1,7 +1,6 @@
 # CoherentSearch (C)
 
-A C port of [`CoherentSearch.jl`](https://github.com/scottransom/CoherentSearch.jl)
-(local checkout: `/home/gpps/pulsar_software/CoherentSearch/CoherentSearch.jl`),
+A C port of [`CoherentSearch.jl`](https://github.com/scottransom/CoherentSearch.jl),
 the coherent harmonic-summing pulsar search that folds PRESTO-style `.fft` files
 using the **phase** of every harmonic.  The numerical algorithm follows the Julia
 reference implementation; the candidate output is byte-identical on every
