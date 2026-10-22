@@ -351,6 +351,7 @@ typedef struct {
      * trial grid are unchanged (DM sweeps, multi-file runs). */
     int plan_valid;
     double plan_T;
+    long long plan_N, plan_namps;
     double plan_lofreq, plan_hifreq;
     int plan_lobin, plan_Nprof;
     long long plan_total;

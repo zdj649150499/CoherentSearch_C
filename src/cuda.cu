@@ -219,6 +219,7 @@ struct GpuDecim {
     void *d_dprofs;
     void *d_gather;
     cufftHandle plan;
+    int plan_shared;    /* same handle as an earlier decimation with equal Hk */
 };
 
 struct GpuCtx {
@@ -511,12 +512,25 @@ extern "C" GpuSession *cs_gpu_session_create(
                               (size_t)d->nbins * Nprof * tsz);
         cudaMalloc(&d->d_gather,
                               (size_t)(d->Hk + 1) * Nprof * csz);
-        int nbn = d->nbins;
-        int inemb = d->Hk + 1, onemb = d->nbins;
-        cufftPlanMany(&d->plan, 1, &nbn, &inemb, 1, d->Hk + 1,
-                                  &onemb, 1, d->nbins,
-                                  ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
-        cufftSetStream(d->plan, ctx.stream);
+        /* Decimations k with the same floor(nharms/k) have identical gathered
+         * input/output shapes.  cuFFT plans are shape-based (the pointers are
+         * passed to cufftExec*), so share one plan instead of building the same
+         * plan again.  The per-k gather/FFT buffers remain separate. */
+        { int j; for (j = 0; j < di - 1; j++) {
+            if (ctx.decims[j].Hk == d->Hk) {
+                d->plan = ctx.decims[j].plan;
+                d->plan_shared = 1;
+                break;
+            }
+        } }
+        if (!d->plan_shared) {
+            int nbn = d->nbins;
+            int inemb = d->Hk + 1, onemb = d->nbins;
+            cufftPlanMany(&d->plan, 1, &nbn, &inemb, 1, d->Hk + 1,
+                                      &onemb, 1, d->nbins,
+                                      ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
+            cufftSetStream(d->plan, ctx.stream);
+        }
     } }
 
     GPUDBG("decim workspaces ok\n");
@@ -876,7 +890,7 @@ extern "C" void cs_gpu_session_free(GpuSession *S)
     cudaFreeHost(ctx.h_counts);
     cudaFreeHost(ctx.h_records);   /* also releases the mapped device view */
     { int i; for (i = 0; i < ndec; i++) {
-        cufftDestroy(ctx.decims[i].plan);
+        if (!ctx.decims[i].plan_shared) cufftDestroy(ctx.decims[i].plan);
         cudaFree(ctx.decims[i].d_widths);
         free(ctx.decims[i].h_widths);
         cudaFree(ctx.decims[i].d_shape);

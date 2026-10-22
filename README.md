@@ -220,17 +220,18 @@ invoke Julia:
 # Cross-observation / DM sifting (output byte-identical to the Julia copy)
 python/sift_candidates.py --min-snr 5.5 --html sift.html cands/
 
-# Drop RFI-like signals and those with no neighbouring-DM detection
-python/sift_candidates.py -noRFI -DMs 2 --html sift.html cands/
+# Drop RFI-like, harmonic, and no-neighbour-DM signals
+python/sift_candidates.py -noRFI -noharm -DMs 2 --html sift.html cands/
 
 # Partition a file list over processes/devices
 python/parallel_search.py -j 8 -t 1 *.fft -- --threshold 8
 python/parallel_search.py --gpu -j 1 --gpus 0 *.dat -- --maxdecim 16
 ```
 
-In `sift_candidates.py`, `-noRFI` drops signals whose class is `RFI-like`, and
-`-DMs n` with `n >= 2` drops signals carrying the `no-DM-neighbour` flag
-(`n < 2` disables that filter).  Both filters also apply to the HTML report.
+In `sift_candidates.py`, `-noRFI` drops signals whose class is `RFI-like`,
+`-noharm` drops signals classified as `harmonic`, and `-DMs n` with `n >= 2`
+drops signals carrying the `no-DM-neighbour` flag (`n < 2` disables that
+filter).  All filters also apply to the HTML report.
 
 `parallel_search.py -t N` sets `OMP_NUM_THREADS=N` for each job, and `--gpu`
 assigns devices through `CUDA_VISIBLE_DEVICES` while passing `--gpu 0` to each
@@ -357,7 +358,7 @@ the FFTW wisdom cache is warm (no GPU used):
 |---:|---:|---:|
 | 1 | 8.56 s | 9.19 s |
 | 4 | 2.31 s | 2.90 s |
-| 8 | **1.63 s** | 2.35 s |
+| 8 | **1.57 s** | 2.35 s |
 | 16 | 2.20 s | 2.94 s |
 | 32 | 3.48 s | 4.24 s |
 
@@ -371,11 +372,11 @@ Julia rows use the corresponding `_red.fft` files (Julia has no in-memory
 | Single `.fft`, C default (1 thread) | 2.05 s | one core per process |
 | Single `.fft`, C `--threads 16` | **0.27 s** | Julia `-t auto` 1.20 s; Julia `-t 16` 0.92 s |
 | C CPU, 105-file list, default (1 thread) | 216 s (3.6 min) | intended for batch mode |
-| C CPU, 105-file list, `--threads 14` | **23.7 s** | ~200 MB RSS |
-| C CPU, 105-file list, `--threads 8` | 30.2 s | memory-bandwidth limited |
+| C CPU, 105-file list, `--threads 14` | **23.3 s** | ~200 MB RSS |
+| C CPU, 105-file list, `--threads 8` | 29.8 s | memory-bandwidth limited |
 | C CPU, 105-file list, 12 processes × `-t 1` | 30.1 s | ~65 MB RSS each |
-| C CPU, 105-file list, 16 processes × `-t 1` | 38.1 s | memory-bandwidth bound |
-| C GPU, 105-file list | **7.05 s** | ~250 MB RSS, one shared context |
+| C CPU, 105-file list, 16 processes × `-t 1` | 36.1 s | memory-bandwidth bound |
+| C GPU, 105-file list | **7.0 s** | ~250 MB RSS, one shared context |
 | Julia CPU, single file / 105-file list | 1.20 s / 62.6 s | Julia `-t auto`, includes startup |
 | Julia GPU, 105-file list | 19.5 s | includes CUDA.jl loading |
 
@@ -394,14 +395,14 @@ comparisons, lower it for speed.
 Per-file `realfft`+`rednoise` in memory costs about 0.05 s.  When a CPU process
 has more than one search thread (or when running on the GPU), the list driver
 runs two prefetch producer threads over a four-slot buffer, hiding that work
-behind the search: the 105-file list takes 23.7 s with 14 CPU threads and
-7.05 s on the GPU.
+behind the search: the 105-file list takes 23.3 s with 14 CPU threads and
+7.0 s on the GPU.
 
 Further optimisations in this version:
 
 - GPU metric kernels append only above-threshold candidates to compact record
   buffers with atomics, so the host no longer scans/copies ~73 million metrics
-  per file (105-file GPU run: 18.4 -> 7.05 s);
+  per file (105-file GPU run: 18.4 -> 7.0 s);
 - candidate records are written straight into mapped pinned host memory; each
   GPU chunk uses one blocking count copy as its completion point, with no
   explicit stream synchronization and no record device-to-host copies;
@@ -410,6 +411,8 @@ Further optimisations in this version:
   uploads and no device-to-device copy of the FFT data;
 - CUDA/cuFFT return-value checks are not used in the compute path; device
   discovery still validates that the requested GPU exists;
+- decimation factors whose `floor(nharms/k)` matches share one cuFFT plan
+  (their gather/FFT buffers stay separate);
 - all decimation gathers are one packed kernel launch per chunk, and the
   active-harmonic state is one 16-byte-per-entry copy instead of three;
 - boxcar shapes are cached per decimation and only recomputed/copied when the
@@ -417,7 +420,9 @@ Further optimisations in this version:
 - the CPU interpolator zeroes only the DC row and harmonics that are actually
   unfilled, instead of the whole `(nharms+1) x Nprof` stack each chunk;
 - a process-wide FFTW planner mutex makes the prefetch and search threads safe
-  (plan execution remains parallel).
+  (plan execution remains parallel);
+- the `.dat` pipeline creates the inverse FFTW plan only to reproduce PRESTO's
+  forward-plan choice, then releases it immediately (it is never executed).
 
 A hand-written AVX-512 assembly version of the boxcar scan was also implemented
 and benchmarked.  It produced bit-identical results but ran ~17% slower than the
@@ -431,8 +436,8 @@ cuFFT plan setup included):
 | workload | CPU 8 threads | GPU | Julia GPU (end to end) |
 |---|---:|---:|---:|
 | `-n 60 --maxdecim 16` | 0.29 s | **0.12 s** | 8.4 s |
-| `-n 120 --maxdecim 16` | 1.63 s | **0.52 s** | 8.4 s |
-| `-n 240 --maxdecim 16` | 9.57 s | **2.36 s** | — |
+| `-n 120 --maxdecim 16` | 1.57 s | **0.52 s** | 8.4 s |
+| `-n 240 --maxdecim 16` | 9.43 s | **2.36 s** | — |
 
 The C GPU fixed setup is about 0.1 s here because this host runs a CUDA MPS
 server; earlier cold-context runs included about 0.8 s and were slower than the

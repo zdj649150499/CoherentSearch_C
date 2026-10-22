@@ -36,7 +36,6 @@ struct DatPipe {
     long long N;
     long long ncomplex;
     fftwf_plan plan;
-    fftwf_plan plan_inv;   /* created alongside, as PRESTO's fftwcall does */
     float *samples;       /* N floats, realfft works here in place */
     float *red;           /* N floats = N/2 complex (the rednoise output) */
     float *powbuf;
@@ -271,7 +270,6 @@ void datpipe_free(DatPipe *p)
     if (!p) return;
     cs_fftw_plan_lock();
     if (p->plan) fftwf_destroy_plan(p->plan);
-    if (p->plan_inv) fftwf_destroy_plan(p->plan_inv);
     cs_fftw_plan_unlock();
     if (p->samples) fftwf_free(p->samples);
     free(p->red);
@@ -287,7 +285,6 @@ static int datpipe_prepare(DatPipe *p, long long N)
     if (p->N == N && p->samples && p->red) return 0;
     cs_fftw_plan_lock();
     if (p->plan) { fftwf_destroy_plan(p->plan); p->plan = NULL; }
-    if (p->plan_inv) { fftwf_destroy_plan(p->plan_inv); p->plan_inv = NULL; }
     cs_fftw_plan_unlock();
     if (p->samples) { fftwf_free(p->samples); p->samples = NULL; }
     free(p->red); p->red = NULL;
@@ -309,16 +306,21 @@ static int datpipe_prepare(DatPipe *p, long long N)
     int nfft = (int)p->ncomplex;
     /* PRESTO's fftwcall builds the forward and inverse plans back to back and
      * then executes the forward one; doing the same reproduces its plan choice
-     * (the forward-only sequence differs in the last bits). */
+     * (the forward-only sequence differs in the last bits).  The inverse plan
+     * is never executed, so release it immediately instead of holding one per
+     * pipeline slot for the whole run. */
     cs_fftw_plan_lock();
     p->plan = fftwf_plan_dft_1d(nfft, (fftwf_complex *)p->samples,
                                 (fftwf_complex *)p->samples, FFTW_FORWARD,
                                 FFTW_ESTIMATE);
-    p->plan_inv = fftwf_plan_dft_1d(nfft, (fftwf_complex *)p->samples,
-                                    (fftwf_complex *)p->samples, FFTW_BACKWARD,
-                                    FFTW_ESTIMATE);
+    fftwf_plan inv = fftwf_plan_dft_1d(nfft, (fftwf_complex *)p->samples,
+                                      (fftwf_complex *)p->samples, FFTW_BACKWARD,
+                                      FFTW_ESTIMATE);
     cs_fftw_plan_unlock();
-    if (!p->plan || !p->plan_inv) return -1;
+    if (!p->plan || !inv) return -1;
+    cs_fftw_plan_lock();
+    fftwf_destroy_plan(inv);
+    cs_fftw_plan_unlock();
 
     int cap = p->endwidth;
     p->powcap = cap;

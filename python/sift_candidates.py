@@ -41,10 +41,11 @@ consistent, *non-edge* DM of peak S/N, (c) are detected at >= 2 neighbouring DMs
 frequency.  Broadband / edge-peaked / single-DM detections are flagged and
 down-ranked, never silently dropped (use --min-score to trim the tail).
 
-Two optional output filters are available:
+Three optional output filters are available:
 
   -noRFI       drop signals classified as ``RFI-like``
   -DMs n       when n >= 2, drop signals flagged ``no-DM-neighbour``
+  -noharm      drop signals classified as ``harmonic`` (harmonically related)
 
 Author: written for Scott Ransom's CoherentSearch.jl.
 """
@@ -742,6 +743,9 @@ def main(argv=None):
                     metavar="n",
                     help="when n >= 2, drop signals flagged no-DM-neighbour "
                          "(n < 2 disables this filter)")
+    ap.add_argument("-noharm", "--noharm", "--no-harm", dest="no_harm",
+                    action="store_true",
+                    help="drop signals whose class is harmonic")
     ap.add_argument("--top", type=int, default=60,
                     help="report at most this many signals")
     ap.add_argument("--html-top", type=int, default=24,
@@ -803,6 +807,10 @@ def main(argv=None):
         signals = [s for s in signals if s.klass != "RFI-like"]
     if args.dms >= 2:
         signals = [s for s in signals if "no-DM-neighbour" not in s.flags]
+    if args.no_harm:
+        signals = [s for s in signals
+                   if s.klass != "harmonic"
+                   and not any(f.startswith("harm") for f in s.flags)]
     signals.sort(key=lambda s: s.score, reverse=True)
     ntotal = len(signals)
     signals = signals[:args.top]

@@ -1100,6 +1100,7 @@ CandidateList search_file(const FFTFile *ft, const SearchParams *p,
 
     int plan_hit = cache && cache->plan_valid && cache->params == p &&
                    cache->plan_T == ft->T &&
+                   cache->plan_N == ft->N && cache->plan_namps == ft->namps &&
                    cache->plan_lofreq == lofreq && cache->plan_hifreq == hifreq &&
                    cache->plan_lobin == lobin && cache->plan_Nprof == Nprof &&
                    cache->plan_total == total;
@@ -1137,6 +1138,8 @@ CandidateList search_file(const FFTFile *ft, const SearchParams *p,
             cache->nchunks = nc;
             cache->params = (SearchParams *)p;
             cache->plan_T = ft->T;
+            cache->plan_N = ft->N;
+            cache->plan_namps = ft->namps;
             cache->plan_lofreq = lofreq;
             cache->plan_hifreq = hifreq;
             cache->plan_lobin = lobin;
