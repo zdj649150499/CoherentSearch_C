@@ -460,6 +460,41 @@ CPU for `-n 60`.  Julia's figures are dominated by CUDA.jl loading (~8 s); on
 this MPS-enabled host Julia was run with `JULIA_CUDA_USE_COMPAT=false` so it
 selects the system driver.
 
+### Multi-process GPU
+
+A GPU is one shared device, so starting several `--gpu 0` processes does not
+increase throughput: they contend for the same SMs, copy engines and memory
+bandwidth.  On a 1.6 ms dataset with 6,735 `.dat` files in 93 lists, one process
+using a combined list took **400 s**, while eight concurrent `--gpu 0` list
+processes took **678 s**.  On an 8-list/664-file subset the scaling was:
+
+| processes | wall |
+|---:|---:|
+| 1 | **40.0 s** |
+| 2 | 58.4 s |
+| 4 | 64.8 s |
+| 8 | 67.8 s |
+
+Progress printing is not a measurable cost here.  On the same 664-file subset,
+`--noprogress` took 40.03 s, default progress to `/dev/null` 40.05 s, to a log
+file 40.02 s, and through a pseudo-terminal 40.18 s.  A test build with the
+per-chunk progress branch and all intermediate `Info:` prints compiled out took
+40.07 s, so the `if` checks and formatting are not the bottleneck.  Keep the
+diagnostics; `--noprogress` only reduces log size.
+
+The combined run produced the same 6,735 `.cohout` files, all byte-identical to
+the eight-process outputs.  For a single GPU, combine the lists and run one
+process:
+
+```sh
+awk 'NF && !seen[$0]++' *.dat.list > all.dat.list
+coherent_search_list --numharm 32 -t 6.0 --maxdecim 16 --gpu 0 \
+    --zaplist Lband.zaplist --lofreq 0.03 all.dat.list
+```
+
+With multiple GPUs, split `all.dat.list` into one list per card and run one
+process per card, setting `CUDA_VISIBLE_DEVICES` (and `--gpu 0`) for each.
+
 Single-thread phase totals (heavy config): interpolation 1.30 s, base inverse
 FFT 0.87 s, base metric 0.79 s, decimated inverse FFTs 3.51 s, decimated metrics
 1.68 s — against Julia's 1.17 / 1.05 / 0.83 / 3.63 / 1.81 s.
