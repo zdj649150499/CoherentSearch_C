@@ -413,3 +413,36 @@ int cs_open_input(const char *path, DatPipe *pipe, FFTFile *ft, int *is_dat)
     fprintf(stderr, "Error: input '%s' must end in .dat or .fft\n", path);
     return -1;
 }
+
+int datpipe_redfft_mem(DatPipe *p, const float *samples, long long N,
+                       double dt, const char *path, FFTFile *ft)
+{
+    memset(ft, 0, sizeof(*ft));
+    ft->path = strdup(path);
+    if (!ft->path) return -1;
+    if (datpipe_prepare(p, N) != 0) return -1;
+    memcpy(p->samples, samples, (size_t)N * sizeof(float));
+    realfft_forward(p->samples, N, p->plan);
+    if (rednoise_apply((const dfcomplex *)p->samples, (dfcomplex *)p->red,
+                       p->ncomplex, N, dt, p->startwidth, p->endwidth,
+                       p->endfreq, p->powbuf, p->oldbuf, p->newbuf,
+                       p->outbuf) != 0)
+        return -1;
+    ft->N = N;
+    ft->T = (double)N * dt;
+    ft->df = 1.0 / ft->T;
+    ft->dereddened = 1;
+    ft->detrended = 1;
+    ft->amps = p->red;
+    ft->namps = p->ncomplex;
+    ft->map = NULL;
+    ft->mapsize = 0;
+    ft->owns_amps = 0;
+    ft->DC = ft->amps[0];
+    ft->Nyquist = ft->amps[1];
+    ft->inf.has_N = 1;
+    ft->inf.N = N;
+    ft->inf.has_dt = 1;
+    ft->inf.dt = dt;
+    return 0;
+}

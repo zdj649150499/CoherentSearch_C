@@ -18,6 +18,7 @@
 #define COHERENT_SEARCH_H
 
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -100,6 +101,9 @@ typedef struct DatPipe DatPipe;
 DatPipe *datpipe_create(int startwidth, int endwidth, double endfreq);
 void     datpipe_free(DatPipe *p);
 int      datpipe_redfft(DatPipe *p, const char *datpath, FFTFile *ft);
+/* In-memory equivalent of the .dat path: realfft + rednoise a float buffer. */
+int      datpipe_redfft_mem(DatPipe *p, const float *samples, long long N,
+                            double dt, const char *path, FFTFile *ft);
 
 /* Open .fft (mmap) or .dat (internal pipeline).  Returns 0 on success and sets
  * *is_dat.  For .dat, ft->amps points into pipe-owned storage. */
@@ -398,6 +402,8 @@ double metric_normalize(const MetricNorm *n, int k, double f, double M);
 /* CLI / output                                                       */
 /* ------------------------------------------------------------------ */
 int  cs_main(int argc, char **argv);
+void cs_usage(FILE *f, int list_mode);
+void cs_usage_mode(FILE *f, int list_mode, int show_examples);
 int  cs_main_list(int argc, char **argv);
 int  write_candidates(const CandidateList *cands, const char *outfile, double threshold);
 void cs_format_double(char *buf, size_t n, double x);

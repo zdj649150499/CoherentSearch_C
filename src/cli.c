@@ -382,7 +382,7 @@ static void opts_defaults(Options *o)
     o->threads = 0;
 }
 
-static void usage(FILE *f, int list_mode)
+void cs_usage_mode(FILE *f, int list_mode, int show_examples)
 {
     if (list_mode)
         fprintf(f, "Usage: coherent_search_list [options] FILE.dat.list\n");
@@ -463,7 +463,9 @@ static void usage(FILE *f, int list_mode)
 "      --baryv V           radial velocity v/c towards the target, applied to\n"
 "                          non-B zaplist entries (default 0.0)\n"
 "      --noplot            accepted and ignored (plotting is off by default)\n"
-"      --help              show this help\n"
+"      --help              show this help\n");
+    if (show_examples) {
+        fprintf(f,
 "\n"
 "Python tools (in python/):\n"
 "  sift_candidates.py    cross-observation/DM sifting of .cohout files\n"
@@ -474,6 +476,12 @@ static void usage(FILE *f, int list_mode)
 "  coherent_search -t 8 --outdir cands *.fft\n"
 "  OMP_NUM_THREADS=8 coherent_search_list -t 5.5 --outdir cands dms.dat.list\n"
 "  coherent_search --gpu 0 -t 8 --blocksize 65536 obs.dat\n");
+    }
+}
+
+void cs_usage(FILE *f, int list_mode)
+{
+    cs_usage_mode(f, list_mode, 1);
 }
 
 static int parse_double(const char *s, double *v)
@@ -688,7 +696,7 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
     { int i; for (i = 1; i < argc; i++) {
         char *arg = argv[i];
         if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
-            usage(stdout, list_mode);
+            cs_usage(stdout, list_mode);
             free(o.files);
             return 0;
         }
@@ -818,7 +826,7 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
         else if (!strcmp(name, "--noplot")) { /* accepted and ignored */ }
         else {
             fprintf(stderr, "Error: unknown option '%s'\n", name);
-            usage(stderr, list_mode);
+            cs_usage(stderr, list_mode);
             free(o.files);
             return 2;
         }
@@ -841,7 +849,7 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
     if (list_mode) {
         if (o.nfiles != 1) {
             fprintf(stderr, "Error: coherent_search_list expects exactly one .list file\n");
-            usage(stderr, list_mode);
+            cs_usage(stderr, list_mode);
             free(o.files);
             return 2;
         }
@@ -863,7 +871,7 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
         }
     } else if (o.nfiles == 0 && !o.prime_wisdom) {
         fprintf(stderr, "Error: at least one FFT file is required\n");
-        usage(stderr, list_mode);
+        cs_usage(stderr, list_mode);
         free(o.files);
         return 2;
     }

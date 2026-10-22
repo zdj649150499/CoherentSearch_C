@@ -312,6 +312,14 @@ static GpuPlan *upload_plans(const DirectPlanSet *dplans, GpuPlan **out_dev)
 /* ------------------------------------------------------------------ */
 /* Availability                                                       */
 /* ------------------------------------------------------------------ */
+static cudaError_t select_device_if_needed(int device)
+{
+    int current = -1;
+    cudaError_t e = cudaGetDevice(&current);
+    if (e == cudaSuccess && current == device) return cudaSuccess;
+    return cudaSetDevice(device);
+}
+
 extern "C" int cs_gpu_available(int device, char *errbuf, size_t errlen)
 {
     int count = 0;
@@ -336,7 +344,7 @@ extern "C" int cs_gpu_available(int device, char *errbuf, size_t errlen)
                              device, count);
         return -1;
     }
-    e = cudaSetDevice(device);
+    e = select_device_if_needed(device);
     if (e != cudaSuccess) {
         if (errbuf) snprintf(errbuf, errlen, "cannot select CUDA device %d: %s",
                              device, cudaGetErrorString(e));
@@ -411,7 +419,7 @@ extern "C" GpuSession *cs_gpu_session_create(
     const size_t tsz = ctx.is_f64 ? sizeof(double) : sizeof(float);
 
     GPUDBG("enter region Nprof=%d nchunks=%lld\n", Nprof, nchunks);
-    cudaSetDevice(device);
+    select_device_if_needed(device);
     /* A blocking (not cudaStreamNonBlocking) stream lets the per-chunk
      * device-to-host count copy act as the completion point through legacy
      * default-stream ordering, so no explicit stream synchronization is

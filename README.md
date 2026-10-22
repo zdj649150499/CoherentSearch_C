@@ -15,6 +15,11 @@ dependency-free SVG pages with `--plot`, and the two Python tools from the Julia
 `bin/` directory (`sift_candidates.py`, `parallel_search.py`) are included and
 work without Julia.
 
+For searching **raw** observations directly, the additional front end
+`prep_coherent_search` performs PRESTO `prepsubband` de-dispersion in memory and
+then runs the same search without writing any intermediate `.dat` files.  See
+[Raw data](#raw-data-prep_coherent_search).
+
 ## AI assistance
 
 This C port, including the CUDA backend, build files, and the Julia-independent
@@ -41,12 +46,21 @@ make VECTOR_WIDTH=auto   # 256 on AMD AVX-512, 512 on Intel AVX-512
 make VECTOR_WIDTH=256    # or force 128/256/512; default native
 ```
 
-This builds two programs:
+This builds the main programs in either configuration:
 
 ```
-bin/coherent_search        FILE.fft|FILE.dat [more inputs] [options]
-bin/coherent_search_list   FILE.dat.list [options]
+bin/coherent_search              FILE.fft|FILE.dat [more inputs] [options]
+bin/coherent_search_list         FILE.dat.list [options]
 ```
+
+and the raw-data front end in **both** `GPU=0` and `GPU=1` builds:
+
+```
+bin/prep_coherent_search         <prepsubband opts> ++ <search opts>
+```
+
+`GPU=0` builds the prep program with CPU-only dedispersion and no CUDA
+linkage; `GPU=1` also enables `-cuda` dedispersion.
 
 The top-level `make GPU=1` forwards the variable to `src/Makefile`.  If you
 switch between `GPU=0` and `GPU=1`, run `make clean` first (make does not track
@@ -57,10 +71,13 @@ compiler flags).
 `CUDA_ARCH=-arch=sm_XX` for cross-building.  On a machine without CUDA use the
 default `GPU=0`; the binary still accepts `--gpu` but warns and runs on the CPU.
 
-Requirements: a C11 compiler (GCC recommended), OpenMP, FFTW3 (float and double),
-and `-march=native` for the AVX2 kernels (there are portable fallbacks).  The
-supplied `bashrc` puts the PSRSOFT FFTW headers and libraries on the include and
-library paths.  `src/Makefile` accepts `FFTW_INC=` / `FFTW_LIB=` overrides.
+Requirements: a C11 compiler (GCC recommended), OpenMP, FFTW3 (float and
+double), and `-march=native` for the AVX2 kernels (there are portable
+fallbacks).  The prep front end additionally needs cfitsio.  The supplied
+`bashrc` puts the PSRSOFT FFTW headers and libraries on the include and library
+paths.  `src/Makefile` accepts `FFTW_INC=` / `FFTW_LIB=` overrides.  The PRESTO
+reader/dedispersion sources are vendored under `third_party/presto/`, so no
+external PRESTO installation or `libpresto` is needed.
 Loop induction variables are declared outside the `for` header (C89 style) for
 compatibility with older compilers; the sources also parse under GCC's
 `-std=gnu89` mode.
@@ -70,6 +87,9 @@ compatibility with older compilers; the sources also parse under GCC's
 ```sh
 bin/coherent_search FILE.fft|FILE.dat [FILE2 ...] [options]
 bin/coherent_search_list FILE.dat.list [options]
+
+# raw observations: prepsubband options, then ++, then search options
+bin/prep_coherent_search <prepsubband options> -o OUT RAW... ++ <search options>
 ```
 
 The command line mirrors the Julia program:
@@ -272,6 +292,110 @@ for command-line or list errors.  `coherent_search_list` keeps one `DatPipe` (re
 list, so only the file read, FFT/rednoise and the search itself are repeated per
 DM.
 
+### Raw data: `prep_coherent_search`
+
+`prep_coherent_search` integrates PRESTO's `prepsubband` de-dispersion.
+The needed `prepsubband` reader/dedispersion sources and headers are vendored
+under `third_party/presto/`; no external PRESTO installation or `libpresto` is
+required.  cfitsio and FFTW are always external; CUDA is needed only for a
+`GPU=1` build.
+
+It accepts the normal `prepsubband` options (`-nsub`, `-downsamp`, `-lodm`,
+`-dmstep`, `-numdms`, `-zerodm`, `-mask`, `-cache`, `-numout`, barycentering,
+etc.).  The de-dispersed time series is kept in memory; the ordinary
+realfft/rednoise and coherent search then run on that memory.  Only the
+`<outprefix>_DM<dm>.inf` files and `.cohout` candidate tables are written ---
+**no `.dat` file is created**.
+
+Run `prep_coherent_search -h` for the combined help: it prints the complete
+PRESTO `prepsubband` option list followed by the complete `coherent_search`
+search-option list.  The same combined help is printed by
+`prep_coherent_search ... ++ --help` without running a search.
+
+Raw input formats:
+
+- **PSRFITS** (`.fits`, `.sf`); `-psrfits` optional, suffix auto-detected.
+- **SIGPROC filterbank** (`.fil`, `.fb`); `-filterbank` optional, suffix
+  auto-detected (`identify_psrdatatype -> SIGPROCFB -> read_filterbank_files`).
+  Tested end-to-end with a synthetic 8-bit filterbank.
+- **Old PRESTO subbands** (`*.sub00` etc., multiple input files).
+- **PRESTO cache** (`-cache`, reading `<fits>_cac` or `<fits>_cac0`); the
+  original raw file is still supplied for its header.
+
+SCAMP/BPP/WAPP/SPIGOT are recognized by PRESTO's identifier but the vendored
+reader intentionally exits.  `.dat`, `.sdat` and event lists are not raw
+dedispersion inputs; use `coherent_search` for an existing `.dat`.
+
+Search options follow a literal `++` separator and are the same options as
+`coherent_search` (`-t`, `-n`, `--maxdecim`, `--blocksize`, `--lofreq`,
+`--outdir`, `--threads`, `--gpu`, `--zaplist`, `--precision`, `--sigma`, ...):
+
+```sh
+prep_coherent_search <prepsubband options> -o OUTPREFIX [RAW...] \
+    ++ <search options> [RAW...]
+```
+
+Raw input files may be placed on either side of `++`; non-option names after
+`++` are appended to the `prepsubband` input list.  When `--gpu N` is present
+after `++`, the de-dispersion and the search both use CUDA device `N`; the
+device is selected once and the context is reused.  An explicit `-cuda M`
+on the preparation side is accepted only when `M == N`.
+
+For example, replacing one `prepsubband` invocation from a DM-generation
+script:
+
+```sh
+prep_coherent_search -numout 851968 -nsub 224 -lodm 1002.50 -dmstep 0.50 \
+    -numdms 210 -downsamp 8 -psrfits -zerodm -cache \
+    -mask OBS_rfifind.mask -o OUTPREFIX OBS.fits \
+    ++ -t 6.0 -n 60 --maxdecim 16 --gpu 0 --blocksize 8192 --lofreq 0.03 \
+       --noprogress
+```
+
+A filterbank input uses the same form (the suffix is enough):
+
+```sh
+prep_coherent_search -numout 65536 -nsub 4 -lodm 10 -dmstep 1 -numdms 1 \
+    -downsamp 1 -nobary -o OUT test.fil \
+    ++ -t 5.0 -n 30 --maxdecim 4 --gpu 0 --lofreq 0.1
+```
+
+This produces `OUTPREFIX_DM1002.50.inf`, `OUTPREFIX_DM1003.00.inf`, ... and
+the matching `.cohout` candidate files; there is no `.dat` anywhere.  Use
+`--outdir` to place the `.cohout` files elsewhere.  Omit `--gpu` for CPU
+de-dispersion and a CPU search.  The prep programs are built in both `GPU=0`
+and `GPU=1` modes: `GPU=0` uses CPU de-dispersion and links no CUDA or
+external PRESTO library; `GPU=1` also permits GPU de-dispersion, enabled
+automatically by `--gpu N` after `++` or explicitly with `-cuda N` before
+`++`.
+
+The `-cache` path reads the PRESTO `_cac`/`_cac0` file; with the same
+`prepsubband` options the in-memory time series was verified bit-identical to
+the `.dat` written by the reference `prepsubband`, and the resulting `.cohout`
+was identical to searching that `.dat`.  `-sub` (subband output) and
+`-outlist` are not meaningful here; `-sub` is rejected with an error.
+
+The in-memory path was compared directly with writing `.dat` and then running
+`coherent_search_list` on those files.  On a short-N 10-DM run the candidate
+files were byte-identical for disk vs memory (CPU and GPU): disk total
+8.49 s CPU / 3.07 s GPU, memory 8.58 s / 3.09 s, while memory avoided 33 MB of
+`.dat`.  On a long-N 10-DM run the disk totals were 7.87 s CPU / 2.57 s GPU and
+the memory totals 8.40 s / 3.03 s; 9 of 10 candidate files were byte-identical,
+and one had S/N 6.19 vs 6.18 at the same frequency (a barycentric bin-boundary
+rounding difference), while memory avoided 260 MB of `.dat`.  The small-set
+timing is nearly identical because written `.dat` files are still in the page
+cache; the in-memory path mainly removes the 221 GB of intermediate `.dat`
+storage for the full 157-command sweep.
+
+Practical checks on the 11.6 ms dataset (157-command generation script):
+a short-N command (`numout=851968`, `nsub=224`, `downsamp=8`) run for 10 DMs
+took 8.5 s with CPU search and 3.1 s with GPU search; a long-N command
+(`numout=6815744`, `nsub=32`, `downsamp=1`) run for 2 DMs took 2.8 s / 1.7 s.
+`-cache` vs direct FITS gave identical `.cohout` files for the tested DMs,
+the log confirmed `Read cache file ..._cac0`, and no `.dat` or `.dat.list`
+files were created.
+
+
 ## What is implemented
 
 - PRESTO `.inf` / `.fft` readers, mmap of the amplitudes.
@@ -280,6 +404,9 @@ DM.
   bookkeeping; the FFTW plans are built the same way PRESTO builds them).
 - `coherent_search_list`: a DM-list driver that reuses every file-independent
   allocation and plan across the list.
+- `prep_coherent_search`: PRESTO `prepsubband`
+  front end that dedisperses raw PSRFITS/filterbank/cache data into memory,
+  write only `.inf` files, and search the in-memory series on CPU or GPU.
 - Exact rational trial grid (`lodr = hidr/nharms`), per-harmonic phase tables
   and the trials-axis (`V = 32`) interpolation kernel of the Julia production
   path, including the `Float32` weights and the non-rational fallback.
@@ -399,6 +526,19 @@ resolve an exact metric tie differently;
 the candidate set is still equivalent.  Keep 65536 for byte-identical
 comparisons, lower it for speed.
 
+On the 1.6 ms dataset, a single process is flat between 32768 and 65536
+(6.2 s per 100-file list); below that, launch overhead wins: 16384 takes 7.2 s,
+8192 10.0 s, and 4096 15.9 s.  Small chunks are useful only when several MPS
+clients run concurrently (see the multi-process section).
+
+A single GPU process uses only about 0.6 GB of VRAM at 65536; using more VRAM
+by enlarging the chunk is counterproductive.  On the 1.6 ms dataset, a
+100-file list took 6.2 s at 65536, 11.4 s at 131072, 15.4 s at 262144, and
+23.9 s at 524288.  Persisting the amplitude array in L2 also slowed it
+(6.9 s).  The limit is L2/bandwidth and per-chunk kernel efficiency, not VRAM
+capacity; 65536 is the single-process optimum here.  Extra VRAM is only useful
+for several MPS clients with smaller per-client chunks.
+
 The CPU default is `--blocksize 2048`, matching Julia's CPU chunking.  On this
 host `--blocksize 1024` is about 15% faster on the 105-file list (19.8 s vs
 23.3 s with 14 threads) and about 24% faster on the `-n 120` 8-thread case
@@ -462,11 +602,13 @@ selects the system driver.
 
 ### Multi-process GPU
 
-A GPU is one shared device, so starting several `--gpu 0` processes does not
-increase throughput: they contend for the same SMs, copy engines and memory
-bandwidth.  On a 1.6 ms dataset with 6,735 `.dat` files in 93 lists, one process
-using a combined list took **400 s**, while eight concurrent `--gpu 0` list
-processes took **678 s**.  On an 8-list/664-file subset the scaling was:
+A GPU is one shared device.  MPS does multiplex clients (the eight-process run
+showed 99% GPU and 97% memory utilization), but at the default
+`--blocksize 65536` each client streams a ~100 MB working set; eight of them
+thrash L2 and saturate memory bandwidth, so aggregate throughput drops.  On a
+1.6 ms dataset with 6,735 `.dat` files in 93 lists, one process using a combined
+list took **400 s**, while eight concurrent `--gpu 0` list processes took
+**678 s**.  On an 8-list/664-file subset the default-chunk scaling was:
 
 | processes | wall |
 |---:|---:|
@@ -475,6 +617,20 @@ processes took **678 s**.  On an 8-list/664-file subset the scaling was:
 | 4 | 64.8 s |
 | 8 | 67.8 s |
 
+Reducing the per-process chunk size changes the working-set/cache balance.
+With `--blocksize 8192`, eight MPS clients reach **31.3 s** on the same 664
+files (16384: 41.7 s; 4096: 38.4 s).  On the full 6,735 files this gives
+**306 s** versus 400 s for one process and 678 s for eight at 65536.  It
+produces the same total number of candidate rows, but smaller chunks change the
+chunk boundaries: 1,089 of 6,735 files differ in a last printed frequency digit
+or a near-tie choice.  If byte-identical output is required, keep 65536 and use
+one process; if throughput matters more than the last digit, use the 8192
+multi-process configuration.
+
+Other MPS experiments did not help: switching to a non-blocking stream/async
+count copy, `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=12`, and an L2 streaming access
+policy all left the 65536 multi-process time at 58-71 s.
+
 Progress printing is not a measurable cost here.  On the same 664-file subset,
 `--noprogress` took 40.03 s, default progress to `/dev/null` 40.05 s, to a log
 file 40.02 s, and through a pseudo-terminal 40.18 s.  A test build with the
@@ -482,9 +638,9 @@ per-chunk progress branch and all intermediate `Info:` prints compiled out took
 40.07 s, so the `if` checks and formatting are not the bottleneck.  Keep the
 diagnostics; `--noprogress` only reduces log size.
 
-The combined run produced the same 6,735 `.cohout` files, all byte-identical to
-the eight-process outputs.  For a single GPU, combine the lists and run one
-process:
+The one-process combined run produced the same 6,735 `.cohout` files, all
+byte-identical to the eight-process 65536 outputs.  For exact output on one GPU,
+combine the lists and run one process:
 
 ```sh
 awk 'NF && !seen[$0]++' *.dat.list > all.dat.list
@@ -492,7 +648,22 @@ coherent_search_list --numharm 32 -t 6.0 --maxdecim 16 --gpu 0 \
     --zaplist Lband.zaplist --lofreq 0.03 all.dat.list
 ```
 
-With multiple GPUs, split `all.dat.list` into one list per card and run one
+For maximum single-GPU throughput, split `all.dat.list` into about eight
+balanced lists and run eight processes with `--blocksize 8192`:
+
+```sh
+split -n l/8 all.dat.list part_
+for f in part_*; do
+    coherent_search_list --noprogress --blocksize 8192 \
+        --numharm 32 -t 6.0 --maxdecim 16 --gpu 0 \
+        --zaplist Lband.zaplist --lofreq 0.03 "$f" &
+done
+wait
+```
+
+This is the 306 s configuration above, with the last-digit/tie caveat.
+
+With multiple GPUs, split the list into one combined list per card and run one
 process per card, setting `CUDA_VISIBLE_DEVICES` (and `--gpu 0`) for each.
 
 Single-thread phase totals (heavy config): interpolation 1.30 s, base inverse
@@ -558,6 +729,12 @@ not improve it.
 
 - `--gpu` requires a `GPU=1` build.  With `GPU=0`, or on a machine with no
   accessible CUDA device, it warns and runs the CPU path.
+- `prep_coherent_search` builds in both configurations.  In a `GPU=0` build
+  the dedispersion is CPU-only (the `-cuda` option is rejected) and no CUDA or
+  external PRESTO library is linked; `GPU=1` additionally supports `-cuda`.
+  It keeps all DMs of one prep command in RAM (about 0.7-1.4 GB for the
+  provided 210/50-DM examples).  `-sub` is rejected and
+  `-outlist` is ignored because no `.dat` files exist.
 - GPU S/N values differ from the CPU path by cuFFT-vs-FFTW rounding (~1e-6 in
   Float32).  On the 105-file DM list this changes the last printed digit for a
   few candidates and, because the harmonic collapse is greedy on nearly tied
@@ -600,6 +777,12 @@ src/search.c                workspaces, FFTW plans, decimation, threaded chunk
 src/candidate.c             candidate lists/collapsing, profile reconstruction,
                             duty cycle, output formatting
 src/datpipe.c               in-memory realfft + rednoise (.dat input)
+src/prep_dedisp.c           prepsubband dedispersion, memstream output + .inf
+src/prep_search.c           in-memory FFTFile -> realfft/rednoise -> search
+src/prep_cli.c              prep/search CLI split at ++
+src/prep_main.c             main() for prep_coherent_search
+include/prep_search.h       shared prep/search options
+third_party/presto/         vendored PRESTO headers + prepsubband sources
 src/cli.c                   argument parsing, list mode, --metricstats
 src/plot.c                  dependency-free SVG candidate-profile pages
 src/cuda.cu                 CUDA backend (interp, cuFFT, metric)
@@ -611,5 +794,6 @@ python/sift_candidates.py   cross-observation/DM candidate sifting (no Julia)
 python/parallel_search.py   split a file list over CPU jobs or CUDA devices
 bin/sift_candidates.py      symlink to python/sift_candidates.py
 bin/parallel_search.py      symlink to python/parallel_search.py
+bin/prep_coherent_search    raw-data prep + coherent search
 src/Makefile                build (GPU=0/1)
 ```
