@@ -128,34 +128,6 @@ __global__ void interp_kernel(OUT *__restrict__ ftprofs,
         store_cplx(&ftprofs[local * (long long)(nh + 1) + h], xr, xi);
 }
 
-/* Gather every k-th harmonic row into a compact contiguous stack.  One
- * launch covers every decimation factor: grid.y selects the slot. */
-struct GatherArg {
-    const void *src;
-    void *dst;
-    int k;
-    int Hk;
-    int block_start;
-};
-
-template <typename C>
-__global__ void gather_kernel_all(const GatherArg *__restrict__ args,
-                                  int ngather, int nh1, int Nprof)
-{
-    int sl = 0;
-    while (sl + 1 < ngather && blockIdx.x >= args[sl + 1].block_start) sl++;
-    const GatherArg A = args[sl];
-    const C *src = (const C *)A.src;
-    C *dst = (C *)A.dst;
-    const long long idx =
-        (long long)(blockIdx.x - A.block_start) * blockDim.x + threadIdx.x;
-    const long long total = (long long)(A.Hk + 1) * Nprof;
-    if (idx >= total) return;
-    const int prof = (int)(idx / (A.Hk + 1));
-    const int i = (int)(idx - (long long)prof * (A.Hk + 1));
-    dst[idx] = src[(long long)prof * nh1 + (long long)i * A.k];
-}
-
 /* ------------------------------------------------------------------ */
 /* Exact per-profile boxcar metric                                    */
 /* ------------------------------------------------------------------ */
@@ -217,9 +189,7 @@ struct GpuDecim {
     int *h_widths;
     double *d_shape;
     void *d_dprofs;
-    void *d_gather;
     cufftHandle plan;
-    int plan_shared;    /* same handle as an earlier decimation with equal Hk */
 };
 
 struct GpuCtx {
@@ -236,8 +206,6 @@ struct GpuCtx {
     GpuPlan *d_plans;
     ActiveEntry *h_entries;
     ActiveEntry *d_entries;
-    GatherArg *d_gather_args;
-    int max_gather_blocks;
 
     cufftHandle plan_base;
     double *d_shape_base;
@@ -510,55 +478,18 @@ extern "C" GpuSession *cs_gpu_session_create(
                               (size_t)d->nw * sizeof(double));
         cudaMalloc(&d->d_dprofs,
                               (size_t)d->nbins * Nprof * tsz);
-        cudaMalloc(&d->d_gather,
-                              (size_t)(d->Hk + 1) * Nprof * csz);
-        /* Decimations k with the same floor(nharms/k) have identical gathered
-         * input/output shapes.  cuFFT plans are shape-based (the pointers are
-         * passed to cufftExec*), so share one plan instead of building the same
-         * plan again.  The per-k gather/FFT buffers remain separate. */
-        { int j; for (j = 0; j < di - 1; j++) {
-            if (ctx.decims[j].Hk == d->Hk) {
-                d->plan = ctx.decims[j].plan;
-                d->plan_shared = 1;
-                break;
-            }
-        } }
-        if (!d->plan_shared) {
-            int nbn = d->nbins;
-            int inemb = d->Hk + 1, onemb = d->nbins;
-            cufftPlanMany(&d->plan, 1, &nbn, &inemb, 1, d->Hk + 1,
-                                      &onemb, 1, d->nbins,
-                                      ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
-            cufftSetStream(d->plan, ctx.stream);
-        }
+        /* Read the decimated harmonics directly from d_ftprofs: input stride k,
+         * batch distance nharms+1.  This removes the gather kernel and its
+         * device-to-device staging buffer entirely. */
+        int nbn = d->nbins;
+        int inemb = d->Hk + 1, onemb = d->nbins;
+        cufftPlanMany(&d->plan, 1, &nbn, &inemb, d->k, ctx.nh + 1,
+                                  &onemb, 1, d->nbins,
+                                  ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
+        cufftSetStream(d->plan, ctx.stream);
     } }
 
     GPUDBG("decim workspaces ok\n");
-    /* gather arguments: one entry per decimation factor */
-    if (ndec > 0) {
-        GatherArg *ga = (GatherArg *)calloc((size_t)ndec, sizeof(GatherArg));
-        int block_start = 0;
-        { int i; for (i = 0; i < ndec; i++) {
-            GpuDecim *d = &ctx.decims[i];
-            ga[i].src = ctx.d_ftprofs;
-            ga[i].dst = d->d_gather;
-            ga[i].k = d->k;
-            ga[i].Hk = d->Hk;
-            ga[i].block_start = block_start;
-            long long total = (long long)(d->Hk + 1) * Nprof;
-            block_start += (int)((total + 255) / 256);
-        } }
-        ctx.max_gather_blocks = block_start > 0 ? block_start : 1;
-        cudaMalloc((void **)&ctx.d_gather_args,
-                              (size_t)ndec * sizeof(GatherArg));
-        cudaMemcpy(ctx.d_gather_args, ga,
-                              (size_t)ndec * sizeof(GatherArg),
-                              cudaMemcpyHostToDevice);
-        free(ga);
-    } else {
-        ctx.d_gather_args = NULL;
-        ctx.max_gather_blocks = 1;
-    }
 
     /* metric outputs */
     ctx.rec_size = ctx.is_f64 ? sizeof(CandRec<double>)
@@ -702,18 +633,6 @@ extern "C" CandidateList cs_gpu_session_run(GpuSession *S, const FFTFile *ft,
         }
 
         GPUDBG("  interp launched\n");
-        /* all decimation gathers in one launch */
-        if (ndec > 0) {
-            if (ctx.is_f64)
-                gather_kernel_all<double2><<<ctx.max_gather_blocks, 256, 0,
-                                             ctx.stream>>>(
-                    ctx.d_gather_args, ndec, ctx.nh + 1, Nprof);
-            else
-                gather_kernel_all<float2><<<ctx.max_gather_blocks, 256, 0,
-                                            ctx.stream>>>(
-                    ctx.d_gather_args, ndec, ctx.nh + 1, Nprof);
-        }
-
         /* base fold */
         if (ctx.is_f64)
             cufftExecZ2D(ctx.plan_base,
@@ -773,11 +692,11 @@ extern "C" CandidateList cs_gpu_session_run(GpuSession *S, const FFTFile *ft,
 
             if (ctx.is_f64)
                 cufftExecZ2D(dd->plan,
-                             (cufftDoubleComplex *)dd->d_gather,
+                             (cufftDoubleComplex *)ctx.d_ftprofs,
                              (double *)dd->d_dprofs);
             else
                 cufftExecC2R(dd->plan,
-                             (cufftComplex *)dd->d_gather,
+                             (cufftComplex *)ctx.d_ftprofs,
                              (float *)dd->d_dprofs);
 
             if (ctx.is_f64) {
@@ -890,12 +809,11 @@ extern "C" void cs_gpu_session_free(GpuSession *S)
     cudaFreeHost(ctx.h_counts);
     cudaFreeHost(ctx.h_records);   /* also releases the mapped device view */
     { int i; for (i = 0; i < ndec; i++) {
-        if (!ctx.decims[i].plan_shared) cufftDestroy(ctx.decims[i].plan);
+        cufftDestroy(ctx.decims[i].plan);
         cudaFree(ctx.decims[i].d_widths);
         free(ctx.decims[i].h_widths);
         cudaFree(ctx.decims[i].d_shape);
         cudaFree(ctx.decims[i].d_dprofs);
-        cudaFree(ctx.decims[i].d_gather);
     } }
     free(ctx.decims);
     cufftDestroy(ctx.plan_base);
@@ -903,7 +821,6 @@ extern "C" void cs_gpu_session_free(GpuSession *S)
     cudaFree(ctx.d_widths_base);
     free(ctx.h_widths_base);
     cudaFree(ctx.d_entries);
-    if (ctx.d_gather_args) cudaFree(ctx.d_gather_args);
     free(ctx.h_entries);
     free(ctx.h_filled);
     free(ctx.h_shapes);

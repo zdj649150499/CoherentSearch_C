@@ -33,6 +33,12 @@ source ~/bashrc
 cd CoherentSearch_C
 make            # CPU-only binary (GPU=0, the default)
 make GPU=1      # also build the CUDA/cuFFT backend
+make LTO=1      # add GCC link-time optimization (same results, ~1-3% faster)
+make GPU=1 LTO=1
+make GPU=1 CUDA_ARCH=-arch=sm_89   # explicit target; default is -arch=native
+make GPU=1 NVCC_EXTRA="-Xptxas -dlcm=cg"   # optional ptxas/codegen flags
+make VECTOR_WIDTH=auto   # 256 on AMD AVX-512, 512 on Intel AVX-512
+make VECTOR_WIDTH=256    # or force 128/256/512; default native
 ```
 
 This builds two programs:
@@ -376,7 +382,7 @@ Julia rows use the corresponding `_red.fft` files (Julia has no in-memory
 | C CPU, 105-file list, `--threads 8` | 29.8 s | memory-bandwidth limited |
 | C CPU, 105-file list, 12 processes × `-t 1` | 30.1 s | ~65 MB RSS each |
 | C CPU, 105-file list, 16 processes × `-t 1` | 36.1 s | memory-bandwidth bound |
-| C GPU, 105-file list | **7.0 s** | ~250 MB RSS, one shared context |
+| C GPU, 105-file list | **5.7 s** | ~250 MB RSS, one shared context |
 | Julia CPU, single file / 105-file list | 1.20 s / 62.6 s | Julia `-t auto`, includes startup |
 | Julia GPU, 105-file list | 19.5 s | includes CUDA.jl loading |
 
@@ -386,23 +392,31 @@ single-threaded processes are faster than 16, and both are slower than one
 14-thread process for this particular 105-file sweep.  Use `--threads N` (or
 `OMP_NUM_THREADS`) when a single process should use more cores.
 
-The GPU default is `--blocksize 65536`.  `--blocksize 32768` is about 4% faster
-on this list, but chunk boundaries differ from Julia's 65536 default, which can
-move a frequency in its 12th decimal or resolve an exact metric tie differently;
+The GPU default is `--blocksize 65536`.  `--blocksize 32768` is about 19%
+faster on the `-n 240` workload (2.08 -> 1.69 s), but chunk boundaries differ
+from Julia's 65536 default, which can move a frequency in its 12th decimal or
+resolve an exact metric tie differently;
 the candidate set is still equivalent.  Keep 65536 for byte-identical
 comparisons, lower it for speed.
+
+The CPU default is `--blocksize 2048`, matching Julia's CPU chunking.  On this
+host `--blocksize 1024` is about 15% faster on the 105-file list (19.8 s vs
+23.3 s with 14 threads) and about 24% faster on the `-n 120` 8-thread case
+(1.2 s vs 1.57 s).  As with the GPU block size, this changes chunk boundaries and
+can move a printed frequency in its last digit or alter a tie, so 2048 remains
+the default for byte-identical output.
 
 Per-file `realfft`+`rednoise` in memory costs about 0.05 s.  When a CPU process
 has more than one search thread (or when running on the GPU), the list driver
 runs two prefetch producer threads over a four-slot buffer, hiding that work
 behind the search: the 105-file list takes 23.3 s with 14 CPU threads and
-7.0 s on the GPU.
+5.7 s on the GPU.
 
 Further optimisations in this version:
 
 - GPU metric kernels append only above-threshold candidates to compact record
   buffers with atomics, so the host no longer scans/copies ~73 million metrics
-  per file (105-file GPU run: 18.4 -> 7.0 s);
+  per file (105-file GPU run: 18.4 -> 5.7 s);
 - candidate records are written straight into mapped pinned host memory; each
   GPU chunk uses one blocking count copy as its completion point, with no
   explicit stream synchronization and no record device-to-host copies;
@@ -411,10 +425,11 @@ Further optimisations in this version:
   uploads and no device-to-device copy of the FFT data;
 - CUDA/cuFFT return-value checks are not used in the compute path; device
   discovery still validates that the requested GPU exists;
-- decimation factors whose `floor(nharms/k)` matches share one cuFFT plan
-  (their gather/FFT buffers stay separate);
-- all decimation gathers are one packed kernel launch per chunk, and the
-  active-harmonic state is one 16-byte-per-entry copy instead of three;
+- decimation cuFFT plans read the strided harmonic rows directly from
+  `d_ftprofs` (`istride=k`, `idist=nharms+1`), eliminating the gather kernel
+  and its device-to-device staging buffer; the CPU path already used the same
+  zero-copy layout with FFTW (`ws->ftprofs`, `istride=k`);
+- the active-harmonic state is one 16-byte-per-entry copy instead of three;
 - boxcar shapes are cached per decimation and only recomputed/copied when the
   filled-harmonic count changes;
 - the CPU interpolator zeroes only the DC row and harmonics that are actually
@@ -435,9 +450,9 @@ cuFFT plan setup included):
 
 | workload | CPU 8 threads | GPU | Julia GPU (end to end) |
 |---|---:|---:|---:|
-| `-n 60 --maxdecim 16` | 0.29 s | **0.12 s** | 8.4 s |
-| `-n 120 --maxdecim 16` | 1.57 s | **0.52 s** | 8.4 s |
-| `-n 240 --maxdecim 16` | 9.43 s | **2.36 s** | — |
+| `-n 60 --maxdecim 16` | 0.29 s | **0.10 s** | 8.4 s |
+| `-n 120 --maxdecim 16` | 1.57 s | **0.45 s** | 8.4 s |
+| `-n 240 --maxdecim 16` | 9.43 s | **2.08 s** | — |
 
 The C GPU fixed setup is about 0.1 s here because this host runs a CUDA MPS
 server; earlier cold-context runs included about 0.8 s and were slower than the
@@ -456,6 +471,53 @@ The original CPU optimisations that got there:
 2. an explicit AVX2 boxcar scan — GCC's auto-vectorised form was 2.4-4.8x slower;
 3. a fused transpose+prefix-sum pass that writes already-transposed prefix sums
    into `psT`, removing the intermediate `(B, nbins)` tile and its memory traffic.
+
+### Compiler tuning
+
+The default build already uses `-O3 -march=native -funroll-loops` with strict
+`-ffp-contract=off`.  `LTO=1` adds GCC link-time optimization
+(`-flto=auto -fno-semantic-interposition`), allowing cross-file inlining and
+constant propagation without changing floating-point semantics.  On the
+105-file CPU list it measured 22.6-23.5 s (median ~22.9 s) versus 23.2-23.3 s
+for the default build, with byte-identical candidates; the heavy single-thread
+case improved from ~8.3 s to ~8.2 s.  The gain is small because most of the hot
+work is already in explicit AVX2/AVX-512 kernels and in FFTW/cuFFT.
+
+Other compiler experiments were not beneficial and are not enabled:
+
+- `-O2` was ~10-15% slower than `-O3` on the heavy case;
+- PGO (`-fprofile-generate` / `-fprofile-use`) was slightly slower
+  single-threaded and neutral with 8 threads;
+- on this Zen 4/5 host, `-mprefer-vector-width=256/512`,
+  `-fno-stack-protector`, `-fno-math-errno/-fno-trapping-math`, and
+  `-funroll-all-loops` gave no consistent gain;
+- `-Ofast` / `-ffast-math` are deliberately excluded: they allow reassociation
+  and contraction and therefore change the last bits of S/N values.
+
+`VECTOR_WIDTH=native` (the default) leaves the choice to `-march=native`, which
+currently prefers 128-bit vectors on Zen 4/5.  `VECTOR_WIDTH=auto` inspects
+`/proc/cpuinfo`: 256 on an AMD CPU with AVX-512, 512 on an Intel CPU with
+AVX-512, and native otherwise.  You can also force `128`, `256`, or `512` with
+`make VECTOR_WIDTH=...`; the option only changes GCC's vector-width preference,
+not the ISA or numerical results.  On this host the forced widths were within
+noise of native, but a native AVX-512 server may benefit from `auto` or `512`.
+
+Only GCC 13 was available on the benchmark host; Clang/AOCC were not installed,
+so their code generation was not tested.  Vendor libraries such as AOCL gain
+most of their speed from hand-tuned assembly and PGO-tuned kernels, which is a
+different lever from compiler flags on these already-specialised kernels.
+
+For the CUDA side, `-arch=native` already produced `sm_89` SASS for the
+RTX 4080 SUPER.  `CUDA_ARCH=-arch=sm_89` (or the appropriate `sm_XX`) can be
+used when cross-building, and `NVCC_EXTRA` passes extra `nvcc`/`ptxas` flags.
+The tested flags (`-Xptxas -dlcm=ca/cg`, `--extra-device-vectorization`,
+`--allow-expensive-optimizations=true`) gave no measurable gain, and ptxas
+reported no spills.  The useful GPU win came from removing the decimation
+gather kernel: cuFFT now reads `d_ftprofs` with `istride=k` and
+`idist=nharms+1` directly, cutting the 105-file list from about 7.0 s to
+5.7 s.  The metric kernel remains occupancy-limited by its per-warp shared
+prefix sums (three blocks/SM here); block-size and carveout experiments did
+not improve it.
 
 ## Known limitations
 
@@ -505,7 +567,7 @@ src/candidate.c             candidate lists/collapsing, profile reconstruction,
 src/datpipe.c               in-memory realfft + rednoise (.dat input)
 src/cli.c                   argument parsing, list mode, --metricstats
 src/plot.c                  dependency-free SVG candidate-profile pages
-src/cuda.cu                 CUDA backend (interp, gather, cuFFT, metric)
+src/cuda.cu                 CUDA backend (interp, cuFFT, metric)
 src/gpu_stub.c              no-CUDA stubs for GPU=0 builds
 include/cuda.cuh            CUDA-internal declarations
 src/CoherentSearch.c        main() for coherent_search

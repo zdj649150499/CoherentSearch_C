@@ -6,6 +6,8 @@
 #
 #   make            # CPU-only binaries (GPU=0, the default)
 #   make GPU=1      # include the CUDA/cuFFT backend
+#   make LTO=1      # add link-time optimization (GCC; same results)
+#   make VECTOR_WIDTH=256   # or 128/512/auto; see below
 #
 # Two programs are built:
 #   bin/coherent_search       FILE.fft|FILE.dat [more inputs] [options]
@@ -20,12 +22,52 @@ FFTW_INC ?= /home/gpps/pulsar_software/include
 FFTW_LIB ?= /home/gpps/pulsar_software/lib
 CUDA_DIR ?= /usr/local/cuda
 GPU      ?= 0
+LTO      ?= 0
+# Vector width preference:
+#   native (default) -> let -march=native decide;
+#   auto             -> 256 on AMD AVX-512, 512 on Intel AVX-512, else native;
+#   128/256/512      -> force that preferred width.
+# This only changes GCC's vector-width preference; it does not change the ISA
+# selected by -march=native or the numerical results.
+VECTOR_WIDTH ?= native
 
 CFLAGS  ?= -O3 -march=native -ffp-contract=off -fopenmp -pthread -std=gnu11 -funroll-loops \
            -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
 CPPFLAGS += -I../include -I$(FFTW_INC)
 LDFLAGS  += -fopenmp -pthread -L$(FFTW_LIB)
 LDLIBS   += -lfftw3f -lfftw3 -lm
+
+VW := $(VECTOR_WIDTH)
+ifeq ($(VW),auto)
+  CPU_VENDOR := $(shell sed -n 's/^vendor_id[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n1)
+  CPU_AVX512 := $(shell grep -m1 -o avx512f /proc/cpuinfo 2>/dev/null)
+  ifeq ($(CPU_AVX512),avx512f)
+    ifeq ($(CPU_VENDOR),GenuineIntel)
+      VW := 512
+    else
+      VW := 256
+    endif
+  else
+    VW := native
+  endif
+endif
+ifeq ($(filter $(VW),native none 128 256 512),)
+  $(error VECTOR_WIDTH must be native, auto, none, 128, 256, or 512)
+endif
+ifneq ($(VW),native)
+ifneq ($(VW),none)
+CFLAGS += -mprefer-vector-width=$(VW)
+endif
+endif
+
+# Link-time optimization: interprocedural inlining/constant propagation across
+# the C translation units.  It does not relax FP contraction or reassociation,
+# so results are unchanged.  Measured gain is small (~1-3% on the 105-file CPU
+# list) but the switch is free when the toolchain supports it.
+ifeq ($(LTO),1)
+CFLAGS  += -flto=auto -fno-semantic-interposition
+LDFLAGS += -flto=auto
+endif
 
 COMMON = fileio.c interp.c boxcar.c search.c candidate.c cli.c datpipe.c plot.c fftw_lock.c zap.c
 COMMON_OBJ = $(COMMON:.c=.o)
@@ -34,7 +76,8 @@ ifeq ($(GPU),1)
 CPPFLAGS += -DCS_HAVE_CUDA
 GPU_OBJ = cuda.o
 CUDA_ARCH ?= -arch=native
-NVCCFLAGS ?= -O3 $(CUDA_ARCH) -std=c++14 -I../include -I$(FFTW_INC) -I$(CUDA_DIR)/include
+NVCC_EXTRA ?=
+NVCCFLAGS ?= -O3 $(CUDA_ARCH) -std=c++14 -I../include -I$(FFTW_INC) -I$(CUDA_DIR)/include $(NVCC_EXTRA)
 LDFLAGS += -L$(CUDA_DIR)/lib64 -Wl,-rpath,$(CUDA_DIR)/lib64
 LDLIBS  += -lcufft -lcudart
 else
