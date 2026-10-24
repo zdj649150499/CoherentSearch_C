@@ -300,8 +300,6 @@ void report_metricstats(const MetricStats *ms, const char *base,
         } }
         fclose(io);
     }
-    fprintf(stderr, "Info: Wrote metric statistics (perblock=%s_metricstats.txt fap=%s_metricfap.txt histogram=%s_metrichist.txt nblocks=%zu)\n",
-            base, base, base, ms->nblocks);
 }
 
 /* ------------------------------------------------------------------ */
@@ -434,8 +432,8 @@ void cs_usage_mode(FILE *f, int list_mode, int show_examples)
 "                          otherwise 1 (one process per input is the intended\n"
 "                          multi-core deployment; use --threads N or\n"
 "                          OMP_NUM_THREADS for a faster single run)\n"
-"      --progressbar       show a progress bar instead of the text percentage\n"
-"      --noprogress        do not print a progress meter\n"
+"      --progressbar       accepted for compatibility (progress output is off)\n"
+"      --noprogress        accepted for compatibility (progress output is off)\n"
 "  -v, --verbose           report the trial grid and interpolation plan\n"
 "      --metricstats       write per-block/per-decimation metric statistics\n"
 "                          (CPU only; not available with --gpu)\n"
@@ -920,7 +918,6 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
         if (g == 1) {
             use_gpu = o.gpu_device;
             if (o.blocksize == 0) o.blocksize = 65536;
-            fprintf(stderr, "Info: using CUDA device %d\n", use_gpu);
         } else if (g == 0) {
             fprintf(stderr, "Warning: %s; running on the CPU (results are equivalent "
                             "to the GPU path to ~2e-7)\n", gerr);
@@ -972,24 +969,20 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
             return 2;
         }
         have_zap = 1;
-        fprintf(stderr, "Info: Read %d birdies from '%s'\n",
-                zaplist.n, o.zaplist);
     } else {
         memset(&zaplist, 0, sizeof(zaplist));
     }
-
-    int progress_mode = o.noprogress ? 0 : (o.progressbar ? 2 : 1);
 
     SearchCache cache;
     memset(&cache, 0, sizeof(cache));
     cache.params = NULL;
     DatPipe *pipe = NULL;
     InputPipeline pipeline;
+    /* Prefetch pipeline: a few producer threads prepare upcoming files while
+     * the current one is searched.  They are free with a GPU (the host idles
+     * during kernels) and, on a CPU run, cost one or two cores out of the many
+     * this one-process-per-input deployment leaves idle. */
     int use_pipeline = (o.nfiles > 1);
-    /* A default single-threaded CPU process must stay at one core; with GPU
-     * the host is idle during kernels, so the prefetch threads are free. */
-    if (use_pipeline && use_gpu < 0 && omp_get_max_threads() <= 1)
-        use_pipeline = 0;
     if (use_pipeline) {
         if (pipeline_init(&pipeline, o.files, o.nfiles) != 0) {
             fprintf(stderr, "Warning: cannot start the prefetch threads; "
@@ -1000,10 +993,8 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
     if (!use_pipeline) pipe = datpipe_create(6, 100, 6.0);
 
     int exit_status = 0;
-    { int fi; for (fi = 0; fi < o.nfiles; fi++) {
+    { int fi = 0; for (; fi < o.nfiles; fi++) {
         const char *path = o.files[fi];
-        if (o.nfiles > 1)
-            fprintf(stderr, "Info: File %d of %d (file=%s)\n", fi + 1, o.nfiles, path);
         FFTFile ft;
         int is_dat = 0;
         if (use_pipeline) {
@@ -1030,8 +1021,6 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
                 if (use_pipeline) pipeline_done(&pipeline);
                 continue;
             }
-            if (o.verbose || o.nfiles == 1)
-                fprintf(stderr, "Info: zapped %d interval(s) in %s\n", nz, path);
         }
 
         if (o.plot_candidates[0]) {
@@ -1045,25 +1034,15 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
                 snprintf(stem, strlen(o.plot_candidates) + 12, "%s_profiles",
                          o.plot_candidates);
             }
-            int pages = plot_candidates_svg(&ft, &pc,
-                                            o.nharms_set ? &params : NULL,
-                                            o.threshold, stem,
-                                            o.plotcols, o.plotrows);
-            fprintf(stderr, "Info: Wrote candidate profile plots (pages=%d stem=%s "
-                            "n=%zu)\n", pages, stem, pc.n);
+            plot_candidates_svg(&ft, &pc,
+                                o.nharms_set ? &params : NULL,
+                                o.threshold, stem,
+                                o.plotcols, o.plotrows);
             free(stem);
             candlist_free(&pc);
             fftfile_close(&ft);
             continue;
         }
-        if (use_gpu >= 0)
-            fprintf(stderr, "Info: Searching (file=%s T=%.10g nharms=%d decimations=%d "
-                            "backend=GPU device=%d)\n",
-                    path, ft.T, params.nharms, params.ndecim, use_gpu);
-        else
-            fprintf(stderr, "Info: Searching (file=%s T=%.10g nharms=%d decimations=%d "
-                            "threads=%d backend=CPU)\n",
-                    path, ft.T, params.nharms, params.ndecim, omp_get_max_threads());
 
         SearchParams *pp = &params;
         MetricStats ms;
@@ -1073,7 +1052,7 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
         CandidateList cands = search_file(&ft, pp, o.lofreq, o.hifreq, o.lobin,
                                           o.blocksize, o.threshold, o.remove,
                                           o.drtol, o.harm_remove, o.numharm,
-                                          progress_mode, use_ms ? &ms : NULL,
+                                          use_ms ? &ms : NULL,
                                           o.normalize, o.verbose, !o.nowisdom,
                                           o.wisdomfile, &cache, 1.0, use_gpu);
 
@@ -1088,11 +1067,9 @@ static int cs_main_mode(int argc, char **argv, int list_mode)
             exit_status = 1;
         if (o.plot && with_ducy.n > 0) {
             char *stem = plot_stem_for(o.plotstem, outfile, path);
-            int pages = plot_candidates_svg(&ft, &with_ducy, pp, o.threshold,
-                                            stem ? stem : "profiles",
-                                            o.plotcols, o.plotrows);
-            fprintf(stderr, "Info: Wrote candidate profile plots (pages=%d stem=%s)\n",
-                    pages, stem ? stem : "profiles");
+            plot_candidates_svg(&ft, &with_ducy, pp, o.threshold,
+                                stem ? stem : "profiles",
+                                o.plotcols, o.plotrows);
             free(stem);
         }
         candlist_free(&with_ducy);

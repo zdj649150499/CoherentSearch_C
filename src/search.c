@@ -6,8 +6,11 @@
 #include <omp.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 #ifndef INFINITY
 #define INFINITY (1.0 / 0.0)
@@ -42,6 +45,8 @@ static void refresh_shape(double *shape, int *shapeH, int nbins,
     }
 }
 
+static char *wisdom_path_for(int precision, const char *wisdom_file);
+
 /* ------------------------------------------------------------------ */
 /* Workspace                                                          */
 /* ------------------------------------------------------------------ */
@@ -54,6 +59,11 @@ static int build_decim(DecimBuf *db, int k, Workspace *ws, const SearchParams *p
     db->k = k;
     db->Hk = nh / k;
     db->nbins = 2 * db->Hk;
+    db->nbase = 2 * nh;
+    /* Harmonic subsampling by k is a time-domain fold, so the decimated
+     * profile is exactly the k-fold average of the full-resolution profile
+     * whenever every base harmonic is used (k divides nharms). */
+    db->fold = (nh % k == 0) && (db->nbins * k == db->nbase);
     db->nw = ladder_boxcar_widths(db->nbins, k, p, db->widths = (int *)malloc(256 * sizeof(int)), 256);
     if (!db->widths) return -1;
     db->wmax = db->widths[db->nw - 1];
@@ -62,16 +72,18 @@ static int build_decim(DecimBuf *db, int k, Workspace *ws, const SearchParams *p
         double *d = (double *)fftw_malloc((size_t)db->nbins * Nprof * sizeof(double));
         if (!d) return -1;
         db->dprofs = d;
-        cs_fftw_plan_lock();
-        db->plan_d = fftw_plan_many_dft_c2r(1, &n2, Nprof,
-                                            (fftw_complex *)ws->ftprofs, NULL, k, nh + 1,
-                                            d, NULL, 1, db->nbins, flags);
-        if (!db->plan_d)
+        if (!db->fold) {
+            cs_fftw_plan_lock();
             db->plan_d = fftw_plan_many_dft_c2r(1, &n2, Nprof,
-                                                (fftw_complex *)ws->ftprofs, NULL, k, nh + 1,
-                                                d, NULL, 1, db->nbins, FFTW_ESTIMATE);
-        cs_fftw_plan_unlock();
-        if (!db->plan_d) return -1;
+                                                (fftw_complex *)ws->ftprofs, NULL, k * Nprof, 1,
+                                                d, NULL, 1, db->nbins, flags);
+            if (!db->plan_d)
+                db->plan_d = fftw_plan_many_dft_c2r(1, &n2, Nprof,
+                                                    (fftw_complex *)ws->ftprofs, NULL, k * Nprof, 1,
+                                                    d, NULL, 1, db->nbins, FFTW_ESTIMATE);
+            cs_fftw_plan_unlock();
+            if (!db->plan_d) return -1;
+        }
         db->psum = malloc((size_t)(db->nbins + db->wmax + 1) * sizeof(double));
         db->bcsig = malloc((size_t)(db->nbins * Nprof < CS_BOXCAR_SIGMA_SAMPLES
                                     ? db->nbins * Nprof : CS_BOXCAR_SIGMA_SAMPLES) * sizeof(double));
@@ -81,16 +93,18 @@ static int build_decim(DecimBuf *db, int k, Workspace *ws, const SearchParams *p
         float *d = (float *)fftwf_malloc((size_t)db->nbins * Nprof * sizeof(float));
         if (!d) return -1;
         db->dprofs = d;
-        cs_fftw_plan_lock();
-        db->plan_f = fftwf_plan_many_dft_c2r(1, &n2, Nprof,
-                                             (fftwf_complex *)ws->ftprofs, NULL, k, nh + 1,
-                                             d, NULL, 1, db->nbins, flags);
-        if (!db->plan_f)
+        if (!db->fold) {
+            cs_fftw_plan_lock();
             db->plan_f = fftwf_plan_many_dft_c2r(1, &n2, Nprof,
-                                                 (fftwf_complex *)ws->ftprofs, NULL, k, nh + 1,
-                                                 d, NULL, 1, db->nbins, FFTW_ESTIMATE);
-        cs_fftw_plan_unlock();
-        if (!db->plan_f) return -1;
+                                                 (fftwf_complex *)ws->ftprofs, NULL, k * Nprof, 1,
+                                                 d, NULL, 1, db->nbins, flags);
+            if (!db->plan_f)
+                db->plan_f = fftwf_plan_many_dft_c2r(1, &n2, Nprof,
+                                                     (fftwf_complex *)ws->ftprofs, NULL, k * Nprof, 1,
+                                                     d, NULL, 1, db->nbins, FFTW_ESTIMATE);
+            cs_fftw_plan_unlock();
+            if (!db->plan_f) return -1;
+        }
         db->psum = malloc((size_t)(db->nbins + db->wmax + 1) * sizeof(float));
         db->bcsig = malloc((size_t)(db->nbins * Nprof < CS_BOXCAR_SIGMA_SAMPLES
                                     ? db->nbins * Nprof : CS_BOXCAR_SIGMA_SAMPLES) * sizeof(float));
@@ -101,7 +115,6 @@ static int build_decim(DecimBuf *db, int k, Workspace *ws, const SearchParams *p
     db->shapeH = -1;
     if (!db->psum || !db->bcsig || !db->shape) return -1;
     if (boxcar_batch_init(&db->batch, db->nbins, db->wmax, Nprof) != 0) return -1;
-    db->src = (uint8_t *)ws->ftprofs;
     return 0;
 }
 
@@ -145,11 +158,11 @@ static int workspace_init(Workspace *ws, const SearchParams *p, int Nprof,
         memset(ws->ftprofs, 0, (size_t)(nh + 1) * Nprof * sizeof(fftw_complex));
         cs_fftw_plan_lock();
         ws->base_plan_d = fftw_plan_many_dft_c2r(1, &n2, Nprof,
-                                                 (fftw_complex *)ws->ftprofs, NULL, 1, nh + 1,
+                                                 (fftw_complex *)ws->ftprofs, NULL, Nprof, 1,
                                                  (double *)ws->profs, NULL, 1, nbins, flags);
         if (!ws->base_plan_d)
             ws->base_plan_d = fftw_plan_many_dft_c2r(1, &n2, Nprof,
-                                                     (fftw_complex *)ws->ftprofs, NULL, 1, nh + 1,
+                                                     (fftw_complex *)ws->ftprofs, NULL, Nprof, 1,
                                                      (double *)ws->profs, NULL, 1, nbins,
                                                      FFTW_ESTIMATE);
         cs_fftw_plan_unlock();
@@ -165,11 +178,11 @@ static int workspace_init(Workspace *ws, const SearchParams *p, int Nprof,
         memset(ws->ftprofs, 0, (size_t)(nh + 1) * Nprof * sizeof(fftwf_complex));
         cs_fftw_plan_lock();
         ws->base_plan_f = fftwf_plan_many_dft_c2r(1, &n2, Nprof,
-                                                  (fftwf_complex *)ws->ftprofs, NULL, 1, nh + 1,
+                                                  (fftwf_complex *)ws->ftprofs, NULL, Nprof, 1,
                                                   (float *)ws->profs, NULL, 1, nbins, flags);
         if (!ws->base_plan_f)
             ws->base_plan_f = fftwf_plan_many_dft_c2r(1, &n2, Nprof,
-                                                      (fftwf_complex *)ws->ftprofs, NULL, 1, nh + 1,
+                                                      (fftwf_complex *)ws->ftprofs, NULL, Nprof, 1,
                                                       (float *)ws->profs, NULL, 1, nbins,
                                                       FFTW_ESTIMATE);
         cs_fftw_plan_unlock();
@@ -278,8 +291,117 @@ void transform_base(Workspace *ws)
     else fftwf_execute(ws->base_plan_f);
 }
 
+/* r_k[j] = (1/k) * sum_{q<k} r_full[j + q*nk], with r_full the profile that
+ * transform_base() just wrote.  This is the exact c2r of the strided
+ * harmonic stack (every harmonic of the full stack is used), so it replaces
+ * an FFT of size 2*Hk per trial by k adds per output bin. */
+static inline void fold_row_f32(int k, int nk, const float *s, float *d)
+{
+    const float invk = 1.0f / (float)k;
+    int j = 0;
+#if defined(__AVX512F__)
+    for (; j + 16 <= nk; j += 16) {
+        __m512 acc = _mm512_loadu_ps(s + j);
+        { int q; for (q = 1; q < k; q++)
+            acc = _mm512_add_ps(acc, _mm512_loadu_ps(s + j + (size_t)q * nk)); }
+        _mm512_storeu_ps(d + j, _mm512_mul_ps(acc, _mm512_set1_ps(invk)));
+    }
+    if (j < nk) {
+        __mmask16 m = (__mmask16)((1u << (nk - j)) - 1u);
+        __m512 acc = _mm512_maskz_loadu_ps(m, s + j);
+        { int q; for (q = 1; q < k; q++)
+            acc = _mm512_add_ps(acc, _mm512_maskz_loadu_ps(m, s + j + (size_t)q * nk)); }
+        _mm512_mask_storeu_ps(d + j, m, _mm512_mul_ps(acc, _mm512_set1_ps(invk)));
+        j = nk;
+    }
+#elif defined(__AVX2__)
+    { __m256 vinv = _mm256_set1_ps(invk);
+      for (; j + 8 <= nk; j += 8) {
+        __m256 acc = _mm256_loadu_ps(s + j);
+        { int q; for (q = 1; q < k; q++)
+            acc = _mm256_add_ps(acc, _mm256_loadu_ps(s + j + (size_t)q * nk)); }
+        _mm256_storeu_ps(d + j, _mm256_mul_ps(acc, vinv));
+    } }
+#endif
+    for (; j < nk; j++) {
+        float a = s[j];
+        { int q; for (q = 1; q < k; q++) a += s[j + (size_t)q * nk]; }
+        d[j] = a * invk;
+    }
+}
+
+static inline void fold_row_f64(int k, int nk, const double *s, double *d)
+{
+    const double invk = 1.0 / (double)k;
+    int j = 0;
+#if defined(__AVX512F__)
+    for (; j + 8 <= nk; j += 8) {
+        __m512d acc = _mm512_loadu_pd(s + j);
+        { int q; for (q = 1; q < k; q++)
+            acc = _mm512_add_pd(acc, _mm512_loadu_pd(s + j + (size_t)q * nk)); }
+        _mm512_storeu_pd(d + j, _mm512_mul_pd(acc, _mm512_set1_pd(invk)));
+    }
+    if (j < nk) {
+        __mmask8 m = (__mmask8)((1u << (nk - j)) - 1u);
+        __m512d acc = _mm512_maskz_loadu_pd(m, s + j);
+        { int q; for (q = 1; q < k; q++)
+            acc = _mm512_add_pd(acc, _mm512_maskz_loadu_pd(m, s + j + (size_t)q * nk)); }
+        _mm512_mask_storeu_pd(d + j, m, _mm512_mul_pd(acc, _mm512_set1_pd(invk)));
+        j = nk;
+    }
+#elif defined(__AVX2__)
+    { __m256d vinv = _mm256_set1_pd(invk);
+      for (; j + 4 <= nk; j += 4) {
+        __m256d acc = _mm256_loadu_pd(s + j);
+        { int q; for (q = 1; q < k; q++)
+            acc = _mm256_add_pd(acc, _mm256_loadu_pd(s + j + (size_t)q * nk)); }
+        _mm256_storeu_pd(d + j, _mm256_mul_pd(acc, vinv));
+    } }
+#endif
+    for (; j < nk; j++) {
+        double a = s[j];
+        { int q; for (q = 1; q < k; q++) a += s[j + (size_t)q * nk]; }
+        d[j] = a * invk;
+    }
+}
+
+/* Every foldable decimation shares the same source row, so produce all of
+ * them in one pass: the 120-float row is read once per trial instead of once
+ * per decimation (8 MB -> 1 MB of source traffic per chunk). */
+void fold_decims(Workspace *ws)
+{
+    int nf = 0;
+    int ks[32], nks[32];
+    void *dst[32];
+    { int i; for (i = 0; i < ws->ndecim && nf < 32; i++) {
+        DecimBuf *db = &ws->decims[i];
+        if (!db->fold) continue;
+        ks[nf] = db->k;
+        nks[nf] = db->nbins;
+        dst[nf] = db->dprofs;
+        nf++;
+    } }
+    if (nf == 0) return;
+    { int t; for (t = 0; t < ws->Nprof; t++) {
+        if (ws->is_f64) {
+            const double *s = (const double *)ws->profs +
+                              (size_t)t * ws->decims[0].nbase;
+            { int f; for (f = 0; f < nf; f++)
+                fold_row_f64(ks[f], nks[f], s,
+                             (double *)dst[f] + (size_t)t * nks[f]); }
+        } else {
+            const float *s = (const float *)ws->profs +
+                             (size_t)t * ws->decims[0].nbase;
+            { int f; for (f = 0; f < nf; f++)
+                fold_row_f32(ks[f], nks[f], s,
+                             (float *)dst[f] + (size_t)t * nks[f]); }
+        }
+    } }
+}
+
 void transform_decim(Workspace *ws, DecimBuf *db)
 {
+    if (db->fold) return;   /* produced up front by fold_decims() */
     if (ws->is_f64) fftw_execute(db->plan_d);
     else fftwf_execute(db->plan_f);
 }
@@ -453,17 +575,8 @@ typedef struct {
     MetricHistogram *hists; /* nstatks * nwin */
     int nstatks;
     int nwin;
-    double t_interp, t_brfft, t_metric, t_decim_brfft, t_decim_metric;
-    double t_busy;
-    long long nchunks;
-} ThreadResult;
 
-static double now_sec(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
-}
+} ThreadResult;
 
 static void stats_push(ThreadResult *tr, BlockMetricStats s)
 {
@@ -498,14 +611,22 @@ static void decim_pass(CandidateList *out, Workspace *ws, DecimBuf *db,
                        double exactcut)
 {
     const int k = db->k, Hk = db->Hk, nbins = db->nbins;
-    double _t0 = now_sec();
     transform_decim(ws, db);
-    tr->t_decim_brfft += now_sec() - _t0;
 
     double rmean = rstart + (double)(n - 1) * lodr / 2.0;
     double nyq = (double)ft->N / 2.0;
+    /* Count of j < n with k*(rstart + j*lodr) < nyq.  The predicate is
+     * monotone in j (j*lodr and the surrounding arithmetic round
+     * monotonically), so bisect on the same comparison the linear scan used;
+     * results are identical, the cost is O(log n) instead of O(n) per pass. */
     int nvalid = 0;
-    while (nvalid < n && (double)k * (rstart + (double)nvalid * lodr) < nyq) nvalid++;
+    { int lo = 0, hi = n;
+      while (lo < hi) {
+          int mid = lo + ((hi - lo) >> 1);
+          if ((double)k * (rstart + (double)mid * lodr) < nyq) lo = mid + 1;
+          else hi = mid;
+      }
+      nvalid = lo; }
 
     double sig_d;
     if (p->sigma == CS_SIGMA_ANALYTIC)
@@ -525,7 +646,6 @@ static void decim_pass(CandidateList *out, Workspace *ws, DecimBuf *db,
         mbuf = (double *)malloc((size_t)(nvalid ? nvalid : 1) * sizeof(double));
     }
 
-    double _t1 = now_sec();
     if (ws->is_f64) {
         double sig = sig_d;
         double invsigma = sig > 0.0 ? 1.0 / sig : 0.0;
@@ -543,8 +663,58 @@ static void decim_pass(CandidateList *out, Workspace *ws, DecimBuf *db,
                            (float *)db->psum, db->widths, db->nw, nbins,
                            invsigma, db->shape, exactcut);
     }
-    tr->t_decim_metric += now_sec() - _t1;
 
+    if (!collect && norm == NULL) {
+        /* Vectorised trial scan: identical per-element arithmetic (exact
+         * integer->double conversion, one multiply and one add), just eight
+         * trials at a time; hits are replayed in ascending j so the candidate
+         * order and values match the scalar loop exactly. */
+        int j = 0;
+#if defined(__AVX512F__)
+        const __m512d vrs = _mm512_set1_pd(rstart);
+        const __m512d vlodr = _mm512_set1_pd(lodr);
+        const __m512d vk = _mm512_set1_pd((double)k);
+        const __m512d vnyq = _mm512_set1_pd(nyq);
+        const __m512d vthr = _mm512_set1_pd(threshold);
+        double rfbuf[8];
+        for (; j + 8 <= n; j += 8) {
+            __m512i vj = _mm512_add_epi64(_mm512_set1_epi64(j),
+                                          _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7));
+            __m512d rf = _mm512_add_pd(vrs,
+                                       _mm512_mul_pd(_mm512_cvtepi64_pd(vj), vlodr));
+            __m512d rdec = _mm512_mul_pd(vk, rf);
+            __m512d m = _mm512_loadu_pd(&db->batch.mvals[j]);
+            __mmask8 hit = _mm512_cmp_pd_mask(m, vthr, _CMP_GT_OQ) &
+                           _mm512_cmp_pd_mask(rdec, vnyq, _CMP_LT_OQ);
+            if (!hit) continue;
+            /* Compress the decimated r values (k * rf), not rf itself. */
+            _mm512_mask_compressstoreu_pd(rfbuf, hit, rdec);
+            { int q = 0; unsigned h = hit;
+              while (h) {
+                  int t = __builtin_ctz(h);
+                  h &= h - 1;
+                  double r_dec = rfbuf[q++];
+                  double fdec = r_dec / ft->T;
+                  Candidate c;
+                  c.freq = fdec; c.metric = db->batch.mvals[j + t];
+                  c.r = r_dec; c.nharm = Hk; c.ducy = NAN;
+                  candlist_push(out, c);
+              } }
+        }
+#endif
+        for (; j < n; j++) {
+            double r_dec = (double)k * (rstart + (double)j * lodr);
+            if (!(r_dec < nyq)) continue;
+            double mval = db->batch.mvals[j];
+            double fdec = r_dec / ft->T;
+            if (mval > threshold) {
+                Candidate c;
+                c.freq = fdec; c.metric = mval; c.r = r_dec; c.nharm = Hk;
+                c.ducy = NAN;
+                candlist_push(out, c);
+            }
+        }
+    } else {
     { int j; for (j = 0; j < n; j++) {
         double r_dec = (double)k * (rstart + (double)j * lodr);
         if (!(r_dec < nyq)) continue;
@@ -562,6 +732,7 @@ static void decim_pass(CandidateList *out, Workspace *ws, DecimBuf *db,
             candlist_push(out, c);
         }
     } }
+    }
 
     if (collect && nmb > 0) {
         double flo = (double)k * rstart / ft->T;
@@ -653,52 +824,20 @@ double metric_normalize(const MetricNorm *n, int k, double f, double M)
 /* ------------------------------------------------------------------ */
 /* Threaded chunk region                                              */
 /* ------------------------------------------------------------------ */
-static void render_progress(int mode, long long done, long long total)
-{
-    if (mode == 0) return;
-    double frac = total == 0 ? 1.0 : (double)done / (double)total;
-    int pct = (int)llround(100.0 * frac);
-    if (mode == 2) {
-        const int width = 40;
-        int filled = (int)llround(width * frac);
-        if (filled < 0) filled = 0;
-        if (filled > width) filled = width;
-        fprintf(stderr, "\r  Searching [");
-        { int i; for (i = 0; i < filled; i++) fputc('#', stderr); }
-        { int i; for (i = filled; i < width; i++) fputc(' ', stderr); }
-        fprintf(stderr, "] %3d%%  (%lld/%lld chunks)", pct, done, total);
-    } else {
-        fprintf(stderr, "\r  Searching: %3d%%  (%lld/%lld chunks)", pct, done, total);
-    }
-    fflush(stderr);
-}
-
 /* Collects one chunk's above-threshold candidates and (optionally) statistics. */
-static void process_chunk(Workspace *ws, ThreadResult *tr, const DirectPlanSet *dplans,
-                          const FFTFile *ft, const SearchParams *p,
-                          double r_lo, double lodr, long long total,
-                          long long c, long long nchunks, const long long *cstarts,
-                          int Nprof, int collect, MetricStats *metricstats,
-                          const int *statks, int nstatks, int nwin,
-                          const double **wedges, double threshold,
-                          const MetricNorm *norm, double exactcut,
-                          int use_analytic)
+/* Everything a chunk needs after its profiles are interpolated.  Shared by
+ * the single-file and batched drivers so both run identical arithmetic. */
+static void chunk_after_fill(Workspace *ws, ThreadResult *tr, const FFTFile *ft,
+                             const SearchParams *p, double rstart, double rmean,
+                             double lodr, int n, long long block, int collect,
+                             const int *statks, int nstatks, int nwin,
+                             const double **wedges, double threshold,
+                             const MetricNorm *norm, double exactcut,
+                             int use_analytic)
 {
     const int nh = p->nharms;
     const int nbins = 2 * nh;
-    long long i0 = cstarts[c];
-    int n = (int)((c + 1 < nchunks ? cstarts[c + 1] : total) - i0);
-    double rstart = r_lo + (double)i0 * lodr;
 
-    double _t0 = now_sec();
-    fill_chunk_profiles(ws, dplans, ft, p, rstart, lodr, n, i0);
-    tr->t_interp += now_sec() - _t0;
-    _t0 = now_sec();
-    transform_base(ws);
-    tr->t_brfft += now_sec() - _t0;
-    double rmean = rstart + (double)(n - 1) * lodr / 2.0;
-
-    _t0 = now_sec();
     if (ws->is_f64) {
         double sig = use_analytic ? analytic_sigma(ws->filled, 1, nh)
                                     : block_sigma_f64((double *)ws->profs, nbins, n,
@@ -718,13 +857,53 @@ static void process_chunk(Workspace *ws, ThreadResult *tr, const DirectPlanSet *
         boxcar_metrics_f32(&ws->batch, (float *)ws->profs, n, (float *)ws->psum,
                            ws->widths, ws->nw, nbins, invsigma, ws->shape, exactcut);
     }
-    tr->t_metric += now_sec() - _t0;
 
     MetricHistogram *basehist = NULL;
     if (collect) {
         int w = window_index(wedges[0], nwin, rmean / ft->T);
         basehist = &tr->hists[w - 1];
     }
+    if (!collect && norm == NULL) {
+        /* Same vectorisation as decim_pass: exact per-element arithmetic,
+         * hits replayed in ascending j. */
+        int j = 0;
+#if defined(__AVX512F__)
+        const __m512d vrs = _mm512_set1_pd(rstart);
+        const __m512d vlodr = _mm512_set1_pd(lodr);
+        const __m512d vthr = _mm512_set1_pd(threshold);
+        double rfbuf[8];
+        for (; j + 8 <= n; j += 8) {
+            __m512i vj = _mm512_add_epi64(_mm512_set1_epi64(j),
+                                          _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7));
+            __m512d rf = _mm512_add_pd(vrs,
+                                       _mm512_mul_pd(_mm512_cvtepi64_pd(vj), vlodr));
+            __m512d m = _mm512_loadu_pd(&ws->batch.mvals[j]);
+            __mmask8 hit = _mm512_cmp_pd_mask(m, vthr, _CMP_GT_OQ);
+            if (!hit) continue;
+            _mm512_mask_compressstoreu_pd(rfbuf, hit, rf);
+            { int q = 0; unsigned h = hit;
+              while (h) {
+                  int t = __builtin_ctz(h);
+                  h &= h - 1;
+                  double rv = rfbuf[q++];
+                  Candidate cd;
+                  cd.freq = rv / ft->T; cd.metric = ws->batch.mvals[j + t];
+                  cd.r = rv; cd.nharm = nh; cd.ducy = NAN;
+                  candlist_push(&tr->out, cd);
+              } }
+        }
+#endif
+        for (; j < n; j++) {
+            double metric = ws->batch.mvals[j];
+            double rf = rstart + (double)j * lodr;
+            if (metric > threshold) {
+                Candidate cd;
+                cd.freq = rf / ft->T; cd.metric = metric; cd.r = rf; cd.nharm = nh;
+                cd.ducy = NAN;
+                candlist_push(&tr->out, cd);
+            }
+        }
+    } else {
     { int j; for (j = 0; j < n; j++) {
         double metric = ws->batch.mvals[j];
         if (collect) hist_push(basehist, metric);
@@ -737,6 +916,7 @@ static void process_chunk(Workspace *ws, ThreadResult *tr, const DirectPlanSet *
             candlist_push(&tr->out, cd);
         }
     } }
+    }
     if (collect) {
         double flo = rstart / ft->T;
         double fhi = (rstart + (double)(n - 1) * lodr) / ft->T;
@@ -744,7 +924,7 @@ static void process_chunk(Workspace *ws, ThreadResult *tr, const DirectPlanSet *
         if (ngood > (double)nh) ngood = (double)nh;
         double *mbuf = (double *)malloc((size_t)n * sizeof(double));
         { int j; for (j = 0; j < n; j++) mbuf[j] = ws->batch.mvals[j]; }
-        BlockMetricStats s = block_stats((int)c + 1, 1, nh, nbins, ngood, flo, fhi,
+        BlockMetricStats s = block_stats((int)block, 1, nh, nbins, ngood, flo, fhi,
                                          mbuf, n);
         free(mbuf);
         stats_push(tr, s);
@@ -760,8 +940,50 @@ static void process_chunk(Workspace *ws, ThreadResult *tr, const DirectPlanSet *
             whist = &tr->hists[si * nwin + (w - 1)];
         }
         decim_pass(&tr->out, ws, db, ft, p, rstart, lodr, n, threshold,
-                   c + 1, collect, tr, whist, norm, exactcut);
+                   block, collect, tr, whist, norm, exactcut);
     } }
+}
+
+static void process_chunk(Workspace *ws, ThreadResult *tr, const DirectPlanSet *dplans,
+                          const FFTFile *ft, const SearchParams *p,
+                          double r_lo, double lodr, long long total,
+                          long long c, long long nchunks, const long long *cstarts,
+                          int Nprof, int collect, MetricStats *metricstats,
+                          const int *statks, int nstatks, int nwin,
+                          const double **wedges, double threshold,
+                          const MetricNorm *norm, double exactcut,
+                          int use_analytic)
+{
+    long long i0 = cstarts[c];
+    int n = (int)((c + 1 < nchunks ? cstarts[c + 1] : total) - i0);
+    double rstart = r_lo + (double)i0 * lodr;
+
+    fill_chunk_profiles(ws, dplans, ft, p, rstart, lodr, n, i0);
+    transform_base(ws);
+    fold_decims(ws);
+    chunk_after_fill(ws, tr, ft, p, rstart,
+                     rstart + (double)(n - 1) * lodr / 2.0, lodr, n, c + 1,
+                     collect, statks, nstatks, nwin, wedges, threshold,
+                     norm, exactcut, use_analytic);
+
+}
+
+/* Collapse and order one file's candidates exactly as search_file() does. */
+static void post_process_one(CandidateList *c, int remove, double dr_tol,
+                             int harm_remove, int numharm, double harm_tol)
+{
+    if (remove) {
+        CandidateList kept = remove_duplicates(c, dr_tol);
+        candlist_free(c);
+        *c = kept;
+    } else {
+        candlist_sort_freq_stable(c);
+    }
+    if (harm_remove) {
+        CandidateList kept = remove_harmonics(c, numharm, harm_tol);
+        candlist_free(c);
+        *c = kept;
+    }
 }
 
 static CandidateList search_region(const FFTFile *ft, const SearchParams *p,
@@ -770,7 +992,7 @@ static CandidateList search_region(const FFTFile *ft, const SearchParams *p,
                                    long long total, int Nprof, long long nchunks,
                                    int nt, const long long *cstarts,
                                    double threshold, const MetricNorm *norm,
-                                   MetricStats *metricstats, int progress_mode,
+                                   MetricStats *metricstats,
                                    const DirectPlanSet *dplans)
 {
     CandidateList result; candlist_init(&result);
@@ -819,51 +1041,21 @@ static CandidateList search_region(const FFTFile *ft, const SearchParams *p,
         }
     } }
 
-    long long done = 0;
     #pragma omp parallel num_threads(nt)
     {
         int tid = omp_get_thread_num();
         ThreadResult *mtr = &tr[tid];
         { long long c; for (c = tid; c < nchunks; c += nt) {
-            double _tb = now_sec();
             process_chunk(&workspaces[tid], mtr, dplans, ft, p, r_lo, lodr,
                           total, c, nchunks, cstarts, Nprof, collect,
                           metricstats, statks, nstatks, nwin,
                           (const double **)wedges, threshold, norm, exactcut,
                           analytic_sigma);
-            mtr->t_busy += now_sec() - _tb;
-            mtr->nchunks++;
-            long long d = __atomic_add_fetch(&done, 1, __ATOMIC_RELAXED);
-            if (tid == 0) render_progress(progress_mode, d, nchunks);
         } }
-    }
-    if (progress_mode != 0) {
-        render_progress(progress_mode, nchunks, nchunks);
-        fprintf(stderr, "\n");
     }
 
     { int t; for (t = 0; t < nt; t++) candlist_append(&result, &tr[t].out); }
 
-    if (getenv("CS_PHASES")) {
-        double ti = 0, tb = 0, tm = 0, td = 0, tdm = 0;
-        { int t; for (t = 0; t < nt; t++) {
-            ti += tr[t].t_interp; tb += tr[t].t_brfft; tm += tr[t].t_metric;
-            td += tr[t].t_decim_brfft; tdm += tr[t].t_decim_metric;
-        } }
-        double gt = 0, gs = 0;
-        if (nt == 1) boxcar_gate_times(&gt, &gs);
-        fprintf(stderr, "PHASES interp=%.3f brfft=%.3f metric=%.3f decim-brfft=%.3f decim-metric=%.3f total=%.3f\n",
-                ti, tb, tm, td, tdm, ti + tb + tm + td + tdm);
-        if (nt == 1) fprintf(stderr, "GATE transpose=%.3f scan=%.3f\n", gt, gs);
-        double bmin = 1e30, bmax = 0, bsum = 0;
-        { int t; for (t = 0; t < nt; t++) {
-            if (tr[t].t_busy < bmin) bmin = tr[t].t_busy;
-            if (tr[t].t_busy > bmax) bmax = tr[t].t_busy;
-            bsum += tr[t].t_busy;
-        } }
-        fprintf(stderr, "THREADS n=%d busy min=%.3f max=%.3f avg=%.3f sum=%.3f\n",
-                nt, bmin, bmax, bsum / nt, bsum);
-    }
 
     if (collect) {
         { int t; for (t = 0; t < nt; t++) {
@@ -923,6 +1115,7 @@ static int sigma_sanity_check(const FFTFile *ft, const SearchParams *p,
         double rstart = r_lo + (double)i0 * lodr;
         fill_chunk_profiles(ws, dplans, ft, p, rstart, lodr, n, i0);
         transform_base(ws);
+        fold_decims(ws);
         int nk = 1 + ws->ndecim;
         { int ik; for (ik = 0; ik < nk; ik++) {
             const void *prof;
@@ -1046,8 +1239,6 @@ int cs_prime_wisdom(const SearchParams *p, int Nprof, int wisdom,
         if (prec == CS_PREC_F64) fftw_export_wisdom_to_filename(wpath);
         else fftwf_export_wisdom_to_filename(wpath);
         cs_fftw_plan_unlock();
-        fprintf(stderr, "Info: primed %s FFTW wisdom (nharms=%d, Nprof=%d) -> %s\n",
-                prec == CS_PREC_F64 ? "f64" : "f32", q.nharms, Nprof, wpath);
         free(wpath);
     } }
     return 0;
@@ -1056,7 +1247,7 @@ int cs_prime_wisdom(const SearchParams *p, int Nprof, int wisdom,
 CandidateList search_file(const FFTFile *ft, const SearchParams *p,
                           double lofreq, double hifreq, int lobin, int blocksize,
                           double threshold, int remove, double dr_tol,
-                          int harm_remove, int numharm, int progress_mode,
+                          int harm_remove, int numharm,
                           MetricStats *metricstats, int normalize, int verbose,
                           int wisdom, const char *wisdom_file,
                           SearchCache *cache, double harm_tol,
@@ -1211,7 +1402,7 @@ CandidateList search_file(const FFTFile *ft, const SearchParams *p,
             if (cache) cache->gpu_session = gs;
             else own_session = 1;
         }
-        cands = cs_gpu_session_run(gs, ft, threshold, progress_mode);
+        cands = cs_gpu_session_run(gs, ft, threshold);
         if (own_session) cs_gpu_session_free(gs);
     } else {
         Workspace *ws = NULL;
@@ -1238,21 +1429,28 @@ CandidateList search_file(const FFTFile *ft, const SearchParams *p,
             if (cache) cache->wisdom_done = 1;
         }
 
-        if (p->sigma == CS_SIGMA_ANALYTIC)
+        if (p->sigma == CS_SIGMA_ANALYTIC &&
+            !(cache && cache->sigma_warned &&
+            cache->sigma_warn_T == ft->T &&
+            cache->sigma_warn_namps == ft->namps)) {
             sigma_sanity_check(ft, p, &ws[0], pdplans, r_lo, lodr, total, Nprof);
+            if (cache) {
+                cache->sigma_warned = 1;
+                cache->sigma_warn_T = ft->T;
+                cache->sigma_warn_namps = ft->namps;
+            }
+        }
 
         MetricNorm *norm = NULL;
         if (normalize) {
             MetricStats *normstats = metricstats ? metricstats : (MetricStats *)malloc(sizeof(MetricStats));
             if (!metricstats) metricstats_init(normstats, 0.0, 64.0, 3200, 16);
-            fprintf(stderr, "Info: Normalising: measuring per-(k,frequency) noise (pass 1/2)\n");
             CandidateList dummy = search_region(ft, p, ws, nbins, r_lo, r_hi, lodr,
                                                 total, Nprof, nchunks, nt, cstarts,
-                                                INFINITY, NULL, normstats, progress_mode,
+                                                INFINITY, NULL, normstats,
                                                 pdplans);
             candlist_free(&dummy);
             norm = build_metricnorm(normstats);
-            fprintf(stderr, "Info: Built in-situ normalisation model; searching (pass 2/2)\n");
             if (!metricstats) { metricstats_free(normstats); free(normstats); }
         }
 
@@ -1260,32 +1458,21 @@ CandidateList search_file(const FFTFile *ft, const SearchParams *p,
                               total, Nprof, nchunks, nt, cstarts,
                               threshold, norm,
                               normalize ? NULL : metricstats,
-                              progress_mode, pdplans);
+                              pdplans);
 
         metricnorm_free(norm);
         if (own_ws) workspaces_free(ws, nt, p->nharms);
     }
 
-    fprintf(stderr, "Info: Search complete; post-processing candidates (total_above_threshold=%zu)\n",
-            cands.n);
-
     if (remove) {
-        size_t n0 = cands.n;
         CandidateList kept = remove_duplicates(&cands, dr_tol);
-        fprintf(stderr, "Info: Collapsed near-identical (duplicate) candidates "
-                        "(removed=%zu remaining=%zu)\n",
-                n0 - kept.n, kept.n);
         candlist_free(&cands);
         cands = kept;
     } else {
         candlist_sort_freq_stable(&cands);
     }
     if (harm_remove) {
-        size_t n1 = cands.n;
         CandidateList kept = remove_harmonics(&cands, numharm, harm_tol);
-        fprintf(stderr, "Info: Collapsed harmonically-related candidates "
-                        "(removed=%zu remaining=%zu)\n",
-                n1 - kept.n, kept.n);
         candlist_free(&cands);
         cands = kept;
     }

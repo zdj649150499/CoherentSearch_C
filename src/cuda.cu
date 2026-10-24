@@ -34,13 +34,6 @@ static int rec_cmp_d(const void *a, const void *b)
     const CandRec<double> *y = (const CandRec<double> *)b;
     return (x->j > y->j) - (x->j < y->j);
 }
-static int gpu_dbg(void)
-{
-    static int v = -1;
-    if (v < 0) v = getenv("CS_GPU_DEBUG") ? 1 : 0;
-    return v;
-}
-#define GPUDBG(...) do { if (gpu_dbg()) { fprintf(stderr, "[gpu] " __VA_ARGS__); fflush(stderr); } } while (0)
 
 /* ------------------------------------------------------------------ */
 /* Device arithmetic helpers (explicit rounding, matching the CPU)     */
@@ -57,6 +50,24 @@ static __device__ __forceinline__ double cs_ddiv(double a, double b) { return __
 static __device__ __forceinline__ void store_cplx(float2 *p, float x, float y)
 {
     p->x = x; p->y = y;
+}
+
+/* Zero only the FT columns that the interpolation pass does not write: the DC
+ * column and the harmonics that do not fit in this chunk.  The CPU path does
+ * the same (fill_chunk_profiles); this replaces a full (nharms+1)*Nprof
+ * memset of the complex spectrum per chunk. */
+template <typename OUT>
+__global__ void zero_cols_kernel(OUT *__restrict__ ftprofs, int nh1, int n,
+                                 const int *__restrict__ cols, int ncols)
+{
+    long long j = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    OUT *row = ftprofs + j * (long long)nh1;
+    int c;
+    for (c = 0; c < ncols; c++) {
+        row[cols[c]].x = 0;
+        row[cols[c]].y = 0;
+    }
 }
 static __device__ __forceinline__ void store_cplx(double2 *p, float x, float y)
 {
@@ -131,6 +142,93 @@ __global__ void interp_kernel(OUT *__restrict__ ftprofs,
 /* ------------------------------------------------------------------ */
 /* Exact per-profile boxcar metric                                    */
 /* ------------------------------------------------------------------ */
+/* Per-decimation parameters for the fused fold+metric kernel.  nk is the
+ * folded profile length (2*Hk), woff/soff index the flat width and shape
+ * banks, nvalid is the number of trials below the decimated Nyquist. */
+struct FoldK {
+    int k, nk, nw, wmax;
+    int woff, soff;
+    int nvalid, slot;
+    double invsigma;
+};
+
+/* Fold + boxcar metric in one pass.
+ *
+ * For k | nharms the c2r of the strided harmonic stack is exactly the k-fold
+ * average of the full-resolution profile, so the folded prefix sums follow
+ * from the base prefix sums already in shared memory:
+ *     pf[m] = (1/k) * sum_{q<k} (P[m + q*nk] - P[q*nk])
+ * and the cyclic tail is pf[nk+u] = pf[nk] + pf[u].  Nothing is written to
+ * global memory: the decimated profile never materialises.  The scan below is
+ * arithmetic-for-arithmetic the same as metric_kernel's. */
+template <typename T>
+__global__ void fold_metric_kernel(const T *__restrict__ profs, int nbins, int n,
+                                   const FoldK *__restrict__ dk, int ndk,
+                                   const int *__restrict__ widths,
+                                   const double *__restrict__ shapes,
+                                   int *__restrict__ counters,
+                                   CandRec<T> *__restrict__ records, int rstride,
+                                   double thresh)
+{
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    T *ps = reinterpret_cast<T *>(smem_raw);            /* (nbins+1) * 32 */
+    T *pf = ps + (size_t)(nbins + 1) * 32;              /* (max nk+wmax+1) * 32 */
+    const int b = threadIdx.x;
+    const long long j = (long long)blockIdx.x * blockDim.x + b;
+    if (j >= n) return;
+
+    const T *col = profs + j * (long long)nbins;
+    T p = (T)0;
+    ps[b] = (T)0;
+    { int i; for (i = 1; i <= nbins; i++) {
+        p = cs_dadd(p, col[i - 1]);
+        ps[(long long)i * 32 + b] = p;
+    } }
+
+    { int t; for (t = 0; t < ndk; t++) {
+        const FoldK K = dk[t];
+        if ((long long)K.nvalid <= j) continue;
+        const int k = K.k, nk = K.nk;
+        const T invk = (T)(1.0 / (double)k);
+        T sc = (T)0;
+        { int q; for (q = 0; q < k; q++)
+            sc = cs_dadd(sc, ps[(long long)(q * nk) * 32 + b]); }
+        pf[b] = (T)0;
+        { int m; for (m = 1; m <= nk; m++) {
+            T s = (T)0;
+            { int q; for (q = 0; q < k; q++)
+                s = cs_dadd(s, ps[(long long)(m + q * nk) * 32 + b]); }
+            pf[(long long)m * 32 + b] = cs_dmul(cs_dsub(s, sc), invk);
+        } }
+        const T tot = pf[(long long)nk * 32 + b];
+        { int u; for (u = 1; u <= K.wmax; u++)
+            pf[(long long)(nk + u) * 32 + b] =
+                cs_dadd(tot, pf[(long long)u * 32 + b]); }
+        T best = (T)(-INFINITY);
+        { int i; for (i = 0; i < K.nw; i++) {
+            const int w = widths[K.woff + i];
+            const T duty = cs_ddiv((T)w, (T)nk);
+            const T invsw = (T)(K.invsigma * shapes[K.soff + i]);
+            T m0 = cs_dsub(pf[(long long)w * 32 + b], pf[b]);
+            { int pp; for (pp = 2; pp <= nk; pp++) {
+                T d = cs_dsub(pf[(long long)(pp + w - 1) * 32 + b],
+                              pf[(long long)(pp - 1) * 32 + b]);
+                if (d > m0) m0 = d;
+            } }
+            T cand = cs_dmul(cs_dsub(m0, cs_dmul(duty, tot)), invsw);
+            if (cand > best) best = cand;
+        } }
+        if ((double)best > thresh) {
+            int pos = atomicAdd(&counters[K.slot], 1);
+            if (pos < rstride) {
+                CandRec<T> *r = records + (long long)K.slot * rstride + pos;
+                r->j = (int)j;
+                r->m = best;
+            }
+        }
+    } }
+}
+
 template <typename T>
 __global__ void metric_kernel(const T *__restrict__ profs, int nbins, int n,
                               const int *__restrict__ widths, int nw, int wmax,
@@ -182,49 +280,86 @@ __global__ void metric_kernel(const T *__restrict__ profs, int nbins, int n,
 /* ------------------------------------------------------------------ */
 /* Context                                                            */
 /* ------------------------------------------------------------------ */
+/* Per-stream state: two streams execute consecutive chunks so the host
+ * launch latency and the candidate readback of one chunk overlap the other
+ * chunk's kernels.  Everything a chunk writes (spectrum, profiles, records,
+ * counts, upload staging) is double-buffered per stream; read-only tables
+ * (amplitudes, widths, plan arena) are shared. */
+#define CS_GPU_NST 3
 struct GpuDecim {
     int k, Hk, nbins, nw, wmax;
-    int shapeH;
+    int shapeH[CS_GPU_NST];
+    int fold;      /* 1: metrics come from fold_metric_kernel (no cuFFT) */
+    int slot;      /* count/record slot (decim index + 1) */
+    int woff;      /* offset into the flat fold width bank */
+    int soff;      /* offset into the flat fold shape bank */
     int *d_widths;
     int *h_widths;
-    double *d_shape;
-    void *d_dprofs;
-    cufftHandle plan;
+    double *d_shape[CS_GPU_NST];
+    void *d_dprofs[CS_GPU_NST];
+    cufftHandle plan[CS_GPU_NST];
 };
 
 struct GpuCtx {
     int device;
     int is_f64;
     int nh, Nprof, nbins, ndecim;
-    cudaStream_t stream;
-    void *d_ftprofs;
-    void *d_profs;
+    cudaStream_t st[CS_GPU_NST];
+    cudaEvent_t ev[CS_GPU_NST];
+    void *d_ftprofs[CS_GPU_NST];
+    void *d_profs[CS_GPU_NST];
     void *d_amps;
     long long namps;
 
     GpuPlan *h_plans;
     GpuPlan *d_plans;
-    ActiveEntry *h_entries;
-    ActiveEntry *d_entries;
+    void *d_plans_arena;
+    ActiveEntry *h_entries[CS_GPU_NST];
+    ActiveEntry *d_entries[CS_GPU_NST];
 
-    cufftHandle plan_base;
-    double *d_shape_base;
+    cufftHandle plan_base[CS_GPU_NST];   /* one plan per stream: a cuFFT
+                                           * plan's work area is shared state,
+                                           * so concurrent executions of one
+                                           * plan on different streams would
+                                           * race inside it */
+    double *d_shape_base[CS_GPU_NST];
     int *d_widths_base;
     int *h_widths_base;
     int nw_base, wmax_base;
-    int base_shapeH;
+    int base_shapeH[CS_GPU_NST];
+    double *h_shape_base;   /* per-stream staging lives in h_shapes[s] */
 
     GpuDecim *decims;
 
-    int *d_counts;       /* one per slot: base + each decimation */
-    int *h_counts;       /* pinned */
-    void *d_records;     /* mapped device view of h_records */
-    void *h_records;     /* pinned, mapped: (1+ndecim) * Nprof * rec_size */
+    int *d_counts[CS_GPU_NST];   /* one per slot: base + each decimation */
+    int *h_counts[CS_GPU_NST];   /* pinned */
+    void *d_records[CS_GPU_NST]; /* mapped device view of h_records */
+    void *h_records[CS_GPU_NST]; /* pinned, mapped: (1+ndecim) * Nprof * rec */
     size_t rec_size;
 
     uint8_t *h_filled;
-    double *h_shapes;
+    uint8_t *h_filled_prev;     /* last region's filled pattern */
+    int region_valid;           /* h_filled_prev holds a region */
+    double sig_base_r;          /* analytic sigmas for the current region */
+    int nfd_base_r;
+    double *sig_decim_r;
+    int *nfd_decim_r;
+    int *h_zerocols[CS_GPU_NST]; /* pinned staging: FT columns to zero */
+    int *d_zerocols[CS_GPU_NST];
+    double *h_shapes[CS_GPU_NST]; /* shape staging, one per stream */
     int max_nw;
+
+    /* fused fold+metric path (f32 only; skipped when shared memory is short) */
+    int nfold;
+    FoldK *h_fold[CS_GPU_NST];       /* per-chunk work list, ndec entries */
+    FoldK *d_fold[CS_GPU_NST];
+    double *h_fshape[CS_GPU_NST];    /* packed shapes for the fold decims */
+    double *d_fshape[CS_GPU_NST];
+    int fshape_gen[CS_GPU_NST];      /* generation of d_fshape[s] contents */
+    int *h_foldw;        /* packed width banks for the fold decimations */
+    int *d_foldw;
+    int fshape_n;
+    size_t fold_shared;  /* dynamic shared bytes for fold_metric_kernel */
 };
 
 struct GpuSession {
@@ -250,62 +385,92 @@ static T *upload_array(const T *src, size_t n)
     return d;
 }
 
-static void cfree_field(void *p, const char *what, int i)
-{
-    (void)what;
-    (void)i;
-    if (!p) return;
-    cudaFree(p);
-}
-
 static void free_plans(GpuPlan *plans, int n)
 {
-    if (!plans) return;
-    { int i; for (i = 0; i < n; i++) {
-        cfree_field(plans[i].row, "row", i);
-        cfree_field(plans[i].W, "W", i);
-        cfree_field(plans[i].A_re, "A_re", i);
-        cfree_field(plans[i].A_im, "A_im", i);
-        cfree_field(plans[i].carry, "carry", i);
-        cfree_field(plans[i].grow, "grow", i);
-        cfree_field(plans[i].goff, "goff", i);
-        cfree_field(plans[i].gnj, "gnj", i);
-        cfree_field(plans[i].gW, "gW", i);
-        cfree_field(plans[i].gA_re, "gA_re", i);
-        cfree_field(plans[i].gA_im, "gA_im", i);
-    } }
+    /* All plan tables live in one packed arena; the per-field device pointers
+     * are interior offsets and must not be freed individually. */
+    (void)plans; (void)n;
 }
 
-static GpuPlan *upload_plans(const DirectPlanSet *dplans, GpuPlan **out_dev)
+/* Upload every harmonic's plan tables as one packed device arena (two
+ * cudaMallocs and two memcpys instead of ~11 per harmonic).  The device
+ * pointers stored in the returned host-side GpuPlan array are interior
+ * offsets into that arena. */
+static GpuPlan *upload_plans(const DirectPlanSet *dplans, GpuPlan **out_dev,
+                             void **out_arena)
 {
     const int nh = dplans->n;
     GpuPlan *h = (GpuPlan *)calloc((size_t)nh, sizeof(GpuPlan));
     if (!h) return NULL;
+    const size_t AL = 256;
+    size_t nfields[nh][11];   /* padded field sizes */
+    size_t rfields[nh][11];   /* raw field sizes (valid bytes to copy) */
+    size_t total = 0;
     { int i; for (i = 0; i < nh; i++) {
-        const DirectPlan *s = &dplans->plans[i];
-        GpuPlan *g = &h[i];
-        g->h = s->h; g->m = s->m; g->q = s->q; g->s = s->s;
-        g->base_adv = s->base_adv; g->pnum = s->pnum;
-        g->rfloor0 = s->rfloor0; g->P = s->P;
-        g->row = upload_array(s->row, (size_t)s->q);
-        g->W = upload_array(s->W, (size_t)s->m * s->P);
-        g->A_re = upload_array(s->A_re, (size_t)s->P);
-        g->A_im = upload_array(s->A_im, (size_t)s->P);
-        g->carry = upload_array(s->carry, (size_t)s->P);
-        g->ngrp = s->ngrp;
-        g->grow = upload_array(s->grow, (size_t)s->q);
-        g->goff = upload_array(s->goff, (size_t)(s->ngrp + 1));
-        g->gnj = upload_array(s->gnj, (size_t)s->ngrp);
-        size_t gw_n = (size_t)(s->ngrp > 0 ? s->goff[s->ngrp] : 0);
-        g->gW = upload_array(s->gW, gw_n);
-        g->gA_re = upload_array(s->gA_re, (size_t)CS_DIRECT_GROUP_V * s->ngrp);
-        g->gA_im = upload_array(s->gA_im, (size_t)CS_DIRECT_GROUP_V * s->ngrp);
+        const DirectPlan *sp = &dplans->plans[i];
+        size_t gw_n = (size_t)(sp->ngrp > 0 ? sp->goff[sp->ngrp] : 0);
+        size_t fl[11] = {
+            (size_t)sp->q * sizeof(int32_t),
+            (size_t)sp->m * (size_t)sp->P * sizeof(float),
+            (size_t)sp->P * sizeof(float),
+            (size_t)sp->P * sizeof(float),
+            (size_t)sp->P,
+            (size_t)sp->q * sizeof(int32_t),
+            (size_t)(sp->ngrp + 1) * sizeof(int32_t),
+            (size_t)sp->ngrp * sizeof(int32_t),
+            gw_n * sizeof(float),
+            (size_t)CS_DIRECT_GROUP_V * (size_t)sp->ngrp * sizeof(float),
+            (size_t)CS_DIRECT_GROUP_V * (size_t)sp->ngrp * sizeof(float),
+        };
+        { int f; for (f = 0; f < 11; f++) {
+            rfields[i][f] = fl[f];
+            nfields[i][f] = fl[f] ? (fl[f] + AL - 1) / AL * AL : 0;
+            total += nfields[i][f];
+        } }
     } }
+    char *stage = total ? (char *)malloc(total) : NULL;
+    void *arena = NULL;
+    if (total) cudaMalloc(&arena, total);
+    if (total && (!stage || !arena)) { free(stage); if (arena) cudaFree(arena); free(h); return NULL; }
+    size_t off = 0;
+    { int i; for (i = 0; i < nh; i++) {
+        const DirectPlan *sp = &dplans->plans[i];
+        GpuPlan *g = &h[i];
+        const void *src[11] = {
+            sp->row, sp->W, sp->A_re, sp->A_im, sp->carry, sp->grow,
+            sp->goff, sp->gnj, sp->gW, sp->gA_re, sp->gA_im,
+        };
+        void *dst[11];
+        { int f; for (f = 0; f < 11; f++) {
+            dst[f] = nfields[i][f] ? (char *)arena + off : NULL;
+            if (rfields[i][f]) memcpy((char *)stage + off, src[f], rfields[i][f]);
+            off += nfields[i][f];
+        } }
+        g->h = sp->h; g->m = sp->m; g->q = sp->q; g->s = sp->s;
+        g->base_adv = sp->base_adv; g->pnum = sp->pnum;
+        g->rfloor0 = sp->rfloor0; g->P = sp->P;
+        g->row = (int *)dst[0];
+        g->W = (float *)dst[1];
+        g->A_re = (float *)dst[2];
+        g->A_im = (float *)dst[3];
+        g->carry = (uint8_t *)dst[4];
+        g->ngrp = sp->ngrp;
+        g->grow = (int32_t *)dst[5];
+        g->goff = (int32_t *)dst[6];
+        g->gnj = (int32_t *)dst[7];
+        g->gW = (float *)dst[8];
+        g->gA_re = (float *)dst[9];
+        g->gA_im = (float *)dst[10];
+    } }
+    if (total)
+        cudaMemcpy(arena, stage, total, cudaMemcpyHostToDevice);
+    free(stage);
     GpuPlan *d = NULL;
     cudaMalloc((void **)&d, (size_t)nh * sizeof(GpuPlan));
     cudaMemcpy(d, h, (size_t)nh * sizeof(GpuPlan),
                           cudaMemcpyHostToDevice);
     *out_dev = d;
+    *out_arena = arena;
     return h;
 }
 
@@ -366,19 +531,19 @@ extern "C" int cs_gpu_available(int device, char *errbuf, size_t errlen)
 /* Metric launch                                                      */
 /* ------------------------------------------------------------------ */
 template <typename T>
-static void launch_metric(GpuCtx *ctx, int slot, int nbins, int n,
+static void launch_metric(GpuCtx *ctx, int s, int slot, int nbins, int n,
                           int *d_widths, int nw, int wmax, T invsigma,
                           double *d_shape, double thresh)
 {
     if (n <= 0) return;
-    const T *profs = (T *)ctx->d_profs;
-    if (slot != 0) profs = (const T *)ctx->decims[slot - 1].d_dprofs;
-    int *counter = ctx->d_counts + slot;
-    CandRec<T> *rec = (CandRec<T> *)ctx->d_records +
+    const T *profs = (T *)ctx->d_profs[s];
+    if (slot != 0) profs = (const T *)ctx->decims[slot - 1].d_dprofs[s];
+    int *counter = ctx->d_counts[s] + slot;
+    CandRec<T> *rec = (CandRec<T> *)ctx->d_records[s] +
                       (size_t)slot * ctx->Nprof;
     const size_t shmem = (size_t)(nbins + wmax + 1) * 32 * sizeof(T);
     const int grid = (n + 31) / 32;
-    metric_kernel<T><<<grid, 32, shmem, ctx->stream>>>(
+    metric_kernel<T><<<grid, 32, shmem, ctx->st[s]>>>(
         profs, nbins, n, d_widths, nw, wmax, invsigma, d_shape,
         counter, rec, ctx->Nprof, thresh);
 }
@@ -418,22 +583,23 @@ extern "C" GpuSession *cs_gpu_session_create(
     const size_t csz = ctx.is_f64 ? sizeof(double2) : sizeof(float2);
     const size_t tsz = ctx.is_f64 ? sizeof(double) : sizeof(float);
 
-    GPUDBG("enter region Nprof=%d nchunks=%lld\n", Nprof, nchunks);
     select_device_if_needed(device);
-    /* A blocking (not cudaStreamNonBlocking) stream lets the per-chunk
-     * device-to-host count copy act as the completion point through legacy
-     * default-stream ordering, so no explicit stream synchronization is
-     * needed. */
-    cudaStreamCreate(&ctx.stream);
-    GPUDBG("stream ok\n");
+    /* Two blocking (not cudaStreamNonBlocking) streams execute consecutive
+     * chunks; ordering against the legacy default stream keeps the one-time
+     * table uploads (widths, fold banks, amps) safely ahead of every chunk. */
+    { int s; for (s = 0; s < CS_GPU_NST; s++) {
+        cudaStreamCreate(&ctx.st[s]);
+        cudaEventCreate(&ctx.ev[s]);
+        ctx.base_shapeH[s] = -1;
+        ctx.fshape_gen[s] = -1;
+    } }
 
     /* amplitudes: one full upload per file happens in cs_gpu_session_run() */
     ctx.namps = ft->namps;
     cudaMalloc(&ctx.d_amps, (size_t)ctx.namps * sizeof(float2));
 
     /* harmonic plans */
-    ctx.h_plans = upload_plans(dplans, &ctx.d_plans);
-    GPUDBG("plans uploaded\n");
+    ctx.h_plans = upload_plans(dplans, &ctx.d_plans, &ctx.d_plans_arena);
 
     /* decimation factors */
     int ndec = 0;
@@ -441,89 +607,161 @@ extern "C" GpuSession *cs_gpu_session_create(
     ctx.ndecim = ndec;
     ctx.decims = (GpuDecim *)calloc((size_t)(ndec ? ndec : 1), sizeof(GpuDecim));
 
-    /* workspaces */
-    cudaMalloc(&ctx.d_ftprofs,
-                          (size_t)(ctx.nh + 1) * Nprof * csz);
-    cudaMalloc(&ctx.d_profs, (size_t)ctx.nbins * Nprof * tsz);
+    /* workspaces: one spectrum/profile pair per stream */
+    { int s; for (s = 0; s < CS_GPU_NST; s++) {
+        cudaMalloc(&ctx.d_ftprofs[s], (size_t)(ctx.nh + 1) * Nprof * csz);
+        cudaMalloc(&ctx.d_profs[s], (size_t)ctx.nbins * Nprof * tsz);
+    } }
 
     int n2 = ctx.nbins;
     int inembed = ctx.nh + 1, onembed = n2;
-    cufftPlanMany(&ctx.plan_base, 1, &n2, &inembed, 1, ctx.nh + 1,
-                              &onembed, 1, n2,
-                              ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
-    cufftSetStream(ctx.plan_base, ctx.stream);
+    { int s; for (s = 0; s < CS_GPU_NST; s++) {
+        cufftPlanMany(&ctx.plan_base[s], 1, &n2, &inembed, 1, ctx.nh + 1,
+                                  &onembed, 1, n2,
+                                  ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
+        cufftSetStream(ctx.plan_base[s], ctx.st[s]);
+    } }
 
     {
         int *wbuf = (int *)malloc(256 * sizeof(int));
         ctx.nw_base = ladder_boxcar_widths(ctx.nbins, 1, p, wbuf, 256);
         ctx.wmax_base = wbuf[ctx.nw_base - 1];
-    ctx.base_shapeH = -1;
         ctx.h_widths_base = (int *)malloc((size_t)ctx.nw_base * sizeof(int));
         memcpy(ctx.h_widths_base, wbuf, (size_t)ctx.nw_base * sizeof(int));
         ctx.d_widths_base = upload_array(wbuf, (size_t)ctx.nw_base);
         free(wbuf);
     }
-    cudaMalloc((void **)&ctx.d_shape_base,
-                          (size_t)ctx.nw_base * sizeof(double));
+    { int s; for (s = 0; s < CS_GPU_NST; s++)
+        cudaMalloc((void **)&ctx.d_shape_base[s],
+                              (size_t)ctx.nw_base * sizeof(double)); }
 
-    int di = 0;
-    { int i; for (i = 0; i < p->ndecim; i++) {
+    { int di = 0; { int i; for (i = 0; i < p->ndecim; i++) {
         const int k = p->decimations[i];
         if (k <= 1) continue;
-        GpuDecim *d = &ctx.decims[di++];
+        GpuDecim *d = &ctx.decims[di];
         d->k = k;
         d->Hk = ctx.nh / k;
         d->nbins = 2 * d->Hk;
+        d->slot = di + 1;
         int *wbuf = (int *)malloc(256 * sizeof(int));
         d->nw = ladder_boxcar_widths(d->nbins, k, p, wbuf, 256);
         d->wmax = wbuf[d->nw - 1];
-        d->shapeH = -1;
+        { int s; for (s = 0; s < CS_GPU_NST; s++) d->shapeH[s] = -1; }
         d->h_widths = (int *)malloc((size_t)d->nw * sizeof(int));
         memcpy(d->h_widths, wbuf, (size_t)d->nw * sizeof(int));
         d->d_widths = upload_array(wbuf, (size_t)d->nw);
         free(wbuf);
-        cudaMalloc((void **)&d->d_shape,
-                              (size_t)d->nw * sizeof(double));
-        cudaMalloc(&d->d_dprofs,
-                              (size_t)d->nbins * Nprof * tsz);
+        { int s; for (s = 0; s < CS_GPU_NST; s++) {
+            cudaMalloc((void **)&d->d_shape[s],
+                                  (size_t)d->nw * sizeof(double));
+            cudaMalloc(&d->d_dprofs[s],
+                                  (size_t)d->nbins * Nprof * tsz);
+        } }
+        d->fold = (ctx.nh % k == 0) && (d->nbins * k == 2 * ctx.nh);
+        di++;
+    } } }
+
+    /* Decide whether the fold path fits: it needs the base prefix plus the
+     * largest folded prefix in shared memory and f32 keeps us under the 48 KB
+     * static limit.  If not, every decimation keeps its cuFFT plan. */
+    { size_t maxnk = 0, maxw = 0;
+      { int d; for (d = 0; d < ndec; d++) if (ctx.decims[d].fold) {
+          if ((size_t)ctx.decims[d].nbins > maxnk) maxnk = ctx.decims[d].nbins;
+          if ((size_t)ctx.decims[d].wmax > maxw) maxw = ctx.decims[d].wmax;
+      } }
+      ctx.fold_shared = ((size_t)(ctx.nbins + 1) + maxnk + maxw + 1) * 32 * tsz;
+      if (ctx.is_f64 || ctx.fold_shared > 48u * 1024u) {
+          { int d; for (d = 0; d < ndec; d++) ctx.decims[d].fold = 0; }
+          ctx.fold_shared = 0;
+      }
+    }
+    { int nw_all = 0, nf = 0;
+      { int d; for (d = 0; d < ndec; d++) {
+          if (!ctx.decims[d].fold) continue;
+          nf++;
+          nw_all += ctx.decims[d].nw;
+      } }
+      ctx.nfold = nf;
+      ctx.fshape_n = nw_all;
+      if (nf > 0) {
+          { int s; for (s = 0; s < CS_GPU_NST; s++) {
+              cudaMallocHost((void **)&ctx.h_fold[s], (size_t)ndec * sizeof(FoldK));
+              cudaMalloc((void **)&ctx.d_fold[s], (size_t)ndec * sizeof(FoldK));
+              cudaMallocHost((void **)&ctx.h_fshape[s],
+                             (size_t)(nw_all ? nw_all : 1) * sizeof(double));
+              cudaMalloc((void **)&ctx.d_fshape[s],
+                         (size_t)(nw_all ? nw_all : 1) * sizeof(double));
+          } }
+          ctx.h_foldw = (int *)malloc((size_t)(nw_all ? nw_all : 1) * sizeof(int));
+          cudaMalloc((void **)&ctx.d_foldw,
+                     (size_t)(nw_all ? nw_all : 1) * sizeof(int));
+          int woff = 0, soff = 0;
+          { int d; for (d = 0; d < ndec; d++) {
+              GpuDecim *dd = &ctx.decims[d];
+              if (!dd->fold) continue;
+              dd->woff = woff;
+              dd->soff = soff;
+              memcpy(ctx.h_foldw + woff, dd->h_widths,
+                     (size_t)dd->nw * sizeof(int));
+              woff += dd->nw;
+              soff += dd->nw;
+          } }
+          if (nw_all > 0)
+              cudaMemcpy(ctx.d_foldw, ctx.h_foldw,
+                         (size_t)nw_all * sizeof(int), cudaMemcpyHostToDevice);
+      }
+    }
+
+    { int d; for (d = 0; d < ndec; d++) {
+        GpuDecim *dd = &ctx.decims[d];
+        if (dd->fold) continue;   /* no plan, no dprofs: metrics are folded */
         /* Read the decimated harmonics directly from d_ftprofs: input stride k,
          * batch distance nharms+1.  This removes the gather kernel and its
          * device-to-device staging buffer entirely. */
-        int nbn = d->nbins;
-        int inemb = d->Hk + 1, onemb = d->nbins;
-        cufftPlanMany(&d->plan, 1, &nbn, &inemb, d->k, ctx.nh + 1,
-                                  &onemb, 1, d->nbins,
-                                  ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
-        cufftSetStream(d->plan, ctx.stream);
+        int nbn = dd->nbins;
+        int inemb = dd->Hk + 1, onemb = dd->nbins;
+        { int s; for (s = 0; s < CS_GPU_NST; s++) {
+            cufftPlanMany(&dd->plan[s], 1, &nbn, &inemb, dd->k, ctx.nh + 1,
+                                      &onemb, 1, dd->nbins,
+                                      ctx.is_f64 ? CUFFT_Z2D : CUFFT_C2R, Nprof);
+            cufftSetStream(dd->plan[s], ctx.st[s]);
+        } }
     } }
 
-    GPUDBG("decim workspaces ok\n");
-
-    /* metric outputs */
+    /* metric outputs: counts, records and upload staging are per stream */
     ctx.rec_size = ctx.is_f64 ? sizeof(CandRec<double>)
                               : sizeof(CandRec<float>);
-    cudaMalloc((void **)&ctx.d_counts,
-                          (size_t)(ndec + 1) * sizeof(int));
-    cudaMallocHost((void **)&ctx.h_counts,
-                              (size_t)(ndec + 1) * sizeof(int));
-    /* Candidate records are tiny and sparse: let the metric kernel write them
-     * straight into mapped pinned host memory.  One stream sync per chunk then
-     * leaves both counts and records ready on the host, with no second sync and
-     * no device-to-host record copies. */
-    cudaHostAlloc(&ctx.h_records,
-                             (size_t)(ndec + 1) * Nprof * ctx.rec_size,
-                             cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&ctx.d_records, ctx.h_records, 0);
-
-    ctx.h_entries = (ActiveEntry *)malloc((size_t)ctx.nh * sizeof(ActiveEntry));
-    cudaMalloc((void **)&ctx.d_entries,
-                          (size_t)ctx.nh * sizeof(ActiveEntry));
-    ctx.h_filled = (uint8_t *)malloc((size_t)ctx.nh);
-
     ctx.max_nw = ctx.nw_base;
     { int i; for (i = 0; i < ndec; i++)
         if (ctx.decims[i].nw > ctx.max_nw) ctx.max_nw = ctx.decims[i].nw; }
-    ctx.h_shapes = (double *)malloc((size_t)(ndec + 1) * ctx.max_nw * sizeof(double));
+    { int s; for (s = 0; s < CS_GPU_NST; s++) {
+        cudaMalloc((void **)&ctx.d_counts[s],
+                              (size_t)(ndec + 1) * sizeof(int));
+        cudaMallocHost((void **)&ctx.h_counts[s],
+                              (size_t)(ndec + 1) * sizeof(int));
+        /* Candidate records are tiny and sparse: the metric kernels write
+         * them straight into mapped pinned host memory; one event per chunk
+         * leaves counts and records ready with no extra copies. */
+        cudaHostAlloc(&ctx.h_records[s],
+                                 (size_t)(ndec + 1) * Nprof * ctx.rec_size,
+                                 cudaHostAllocMapped);
+        cudaHostGetDevicePointer(&ctx.d_records[s], ctx.h_records[s], 0);
+        cudaMallocHost((void **)&ctx.h_entries[s],
+                                 (size_t)ctx.nh * sizeof(ActiveEntry));
+        cudaMalloc((void **)&ctx.d_entries[s],
+                                 (size_t)ctx.nh * sizeof(ActiveEntry));
+        cudaMallocHost((void **)&ctx.h_zerocols[s],
+                                 (size_t)(ctx.nh + 1) * sizeof(int));
+        cudaMalloc((void **)&ctx.d_zerocols[s],
+                                 (size_t)(ctx.nh + 1) * sizeof(int));
+        ctx.h_shapes[s] = (double *)malloc(
+            (size_t)(ndec + 1) * ctx.max_nw * sizeof(double));
+    } }
+    ctx.h_filled = (uint8_t *)malloc((size_t)ctx.nh);
+    ctx.h_filled_prev = (uint8_t *)malloc((size_t)ctx.nh);
+    ctx.region_valid = 0;
+    ctx.sig_decim_r = (double *)calloc((size_t)(ndec ? ndec : 1), sizeof(double));
+    ctx.nfd_decim_r = (int *)calloc((size_t)(ndec ? ndec : 1), sizeof(int));
 
     /* dynamic shared memory opt-in for the largest metric kernel */
     {
@@ -549,12 +787,11 @@ extern "C" GpuSession *cs_gpu_session_create(
                      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
     }
 
-    GPUDBG("allocations ok\n");
     S->ndec = ndec;
     return S;
 }
 extern "C" CandidateList cs_gpu_session_run(GpuSession *S, const FFTFile *ft,
-                                             double threshold, int progress_mode)
+                                             double threshold)
 {
     CandidateList cands;
     candlist_init(&cands);
@@ -569,7 +806,6 @@ extern "C" CandidateList cs_gpu_session_run(GpuSession *S, const FFTFile *ft,
     const double lodr = S->lodr;
     const double nyq = S->nyq;
     const SearchParams *p = S->p;
-    const size_t csz = ctx.is_f64 ? sizeof(double2) : sizeof(float2);
 
     if (ft->namps != ctx.namps || ft->N != S->N) {
         fprintf(stderr, "Error: GPU session built for N=%lld/%lld amps but the "
@@ -577,7 +813,6 @@ extern "C" CandidateList cs_gpu_session_run(GpuSession *S, const FFTFile *ft,
                 S->N, ctx.namps, ft->N, ft->namps);
         return cands;
     }
-    GPUDBG("run T=%.12g namps=%lld\n", ft->T, ft->namps);
     /* One full upload of the finished CPU spectrum per file.  The blocking
      * copy also retires the host buffer before this function can return, even
      * if the trial range happens to contain no chunks. */
@@ -586,13 +821,71 @@ extern "C" CandidateList cs_gpu_session_run(GpuSession *S, const FFTFile *ft,
                    (size_t)ctx.namps * sizeof(float2),
                    cudaMemcpyHostToDevice);
 
-    { long long c; for (c = 0; c < nchunks; c++) {
-        cudaMemsetAsync(ctx.d_counts, 0,
-                        (size_t)(ndec + 1) * sizeof(int), ctx.stream);
-        GPUDBG("chunk %lld/%lld start i0=%lld\n", c, nchunks, cstarts[c]);
+    /* Per-chunk launch.  Everything a chunk touches is indexed by its stream
+     * slot s = c % CS_GPU_NST, so chunk c and chunk c+1 run concurrently; the
+     * host only waits for chunk c - CS_GPU_NST before reusing its slot. */
+    double rst_ring[CS_GPU_NST];
+
+    /* Read back one chunk's counts/records and push its candidates.  Uses only
+     * values that survive unchanged from the launch (rstart, k, Hk), so the
+     * candidate order and arithmetic match the single-stream driver. */
+    
+    for (long long c = 0; c < nchunks; c++) {
+        const int s = (int)(c % CS_GPU_NST);
+        cudaStream_t stm = ctx.st[s];
+
+        if (c >= CS_GPU_NST) {
+            /* The slot's previous chunk is complete; harvest its results. */
+            cudaEventSynchronize(ctx.ev[s]);
+            const long long cp = c - CS_GPU_NST;
+            const int sp = (int)(cp % CS_GPU_NST);
+            const double rstartp = rst_ring[sp];
+            int cnts[64];
+            { int sl; for (sl = 0; sl <= ndec && sl < 64; sl++) {
+                cnts[sl] = ctx.h_counts[sp][sl];
+                if (cnts[sl] > Nprof) cnts[sl] = Nprof;
+            } }
+            { int sl; for (sl = 0; sl <= ndec && sl < 64; sl++) {
+                int cnt = cnts[sl];
+                if (cnt <= 0) continue;
+                char *base = (char *)ctx.h_records[sp] +
+                             (size_t)sl * Nprof * ctx.rec_size;
+                CandRec<float> *rf = (CandRec<float> *)base;
+                CandRec<double> *rd = (CandRec<double> *)base;
+                if (ctx.is_f64) qsort(rd, (size_t)cnt, ctx.rec_size, rec_cmp_d);
+                else qsort(rf, (size_t)cnt, ctx.rec_size, rec_cmp_f);
+                int kh = ctx.nh;
+                double kmul = 1.0;
+                if (sl != 0) {
+                    kh = ctx.decims[sl - 1].Hk;
+                    kmul = (double)ctx.decims[sl - 1].k;
+                }
+                { int q; for (q = 0; q < cnt; q++) {
+                    int j = ctx.is_f64 ? rd[q].j : rf[q].j;
+                    double metric = ctx.is_f64 ? rd[q].m : (double)rf[q].m;
+                    if (!(metric > threshold)) continue;
+                    double rfreq = rstartp + (double)j * lodr;
+                    double rsel = kmul != 1.0 ? kmul * rfreq : rfreq;
+                    if (sl != 0) {
+                        if (!(rsel < nyq)) continue;
+                    }
+                    Candidate cd;
+                    cd.freq = rsel / ft->T;
+                    cd.metric = metric;
+                    cd.r = rsel;
+                    cd.nharm = kh;
+                    cd.ducy = NAN;
+                    candlist_push(&cands, cd);
+                } }
+            } }
+        }
+
+        cudaMemsetAsync(ctx.d_counts[s], 0,
+                        (size_t)(ndec + 1) * sizeof(int), stm);
         const long long i0 = cstarts[c];
         const int n = (int)((c + 1 < nchunks ? cstarts[c + 1] : total) - i0);
         const double rstart = r_lo + (double)i0 * lodr;
+        rst_ring[s] = rstart;
 
         /* Which harmonics carry data for this whole chunk. */
         int nactive = 0;
@@ -612,197 +905,273 @@ extern "C" CandidateList cs_gpu_session_run(GpuSession *S, const FFTFile *ft,
                 int res;
                 long long qint;
                 cs_chunk_state(dp, t_first, &res, &qint);
-                ctx.h_entries[nactive].h = h;
-                ctx.h_entries[nactive].res0 = res;
-                ctx.h_entries[nactive].qint0 = qint;
+                ctx.h_entries[s][nactive].h = h;
+                ctx.h_entries[s][nactive].res0 = res;
+                ctx.h_entries[s][nactive].qint0 = qint;
                 nactive++;
             }
         } }
 
-        GPUDBG("  active=%d ngroups=%d\n", nactive, ngroups);
-        cudaMemsetAsync(ctx.d_ftprofs, 0,
-                        (size_t)(ctx.nh + 1) * Nprof * csz, ctx.stream);
+        /* The filled-harmonic pattern only changes at the change points the
+         * chunk table already splits on, so most chunks sit in the same
+         * region as the previous one.  Within a region the analytic sigmas
+         * are constant, and each slot's inactive spectrum columns stay zero
+         * (interp never writes them), so both the sigma recomputation and
+         * the zero-columns upload+kernel can be skipped. */
+        int region_changed =
+            !ctx.region_valid ||
+            memcmp(ctx.h_filled, ctx.h_filled_prev, (size_t)ctx.nh) != 0;
+        if (region_changed) {
+            memcpy(ctx.h_filled_prev, ctx.h_filled, (size_t)ctx.nh);
+            ctx.region_valid = 1;
+            ctx.sig_base_r = analytic_sigma(ctx.h_filled, 1, ctx.nh);
+            ctx.nfd_base_r = 0;
+            { int h; for (h = 1; h <= ctx.nh; h++)
+                ctx.nfd_base_r += ctx.h_filled[h - 1] ? 1 : 0; }
+            { int d; for (d = 0; d < ndec; d++) {
+                GpuDecim *dd = &ctx.decims[d];
+                ctx.sig_decim_r[d] = analytic_sigma(ctx.h_filled, dd->k, dd->Hk);
+                ctx.nfd_decim_r[d] = 0;
+                { int h; for (h = 1; h <= dd->Hk; h++)
+                    ctx.nfd_decim_r[d] += ctx.h_filled[h * dd->k - 1] ? 1 : 0; }
+            } }
+        }
+
+        /* Columns the interp pass will not touch: DC plus inactive harmonics. */
+        /* NOTE: cuFFT's C2R destroys its input array (out-of-place included),
+         * so the inactive/DC columns are clobbered by every exec and must be
+         * re-zeroed each chunk; skipping this when the region is unchanged
+         * leaks the clobbered values into the next chunk's transform. */
+        {
+          { int nc = 0;
+          ctx.h_zerocols[s][nc++] = 0;
+          { int h; for (h = 1; h <= ctx.nh; h++)
+              if (!ctx.h_filled[h - 1]) ctx.h_zerocols[s][nc++] = h; }
+          if (nc > 0) {
+              cudaMemcpyAsync(ctx.d_zerocols[s], ctx.h_zerocols[s],
+                              (size_t)nc * sizeof(int),
+                              cudaMemcpyHostToDevice, stm);
+              const int zb = 256;
+              const int zg = (n + zb - 1) / zb;
+              if (ctx.is_f64)
+                  zero_cols_kernel<double2><<<zg, zb, 0, stm>>>(
+                      (double2 *)ctx.d_ftprofs[s], ctx.nh + 1, n,
+                      ctx.d_zerocols[s], nc);
+              else
+                  zero_cols_kernel<float2><<<zg, zb, 0, stm>>>(
+                      (float2 *)ctx.d_ftprofs[s], ctx.nh + 1, n,
+                      ctx.d_zerocols[s], nc);
+          } }
+        }
         if (nactive > 0) {
-            cudaMemcpyAsync(ctx.d_entries, ctx.h_entries,
+            cudaMemcpyAsync(ctx.d_entries[s], ctx.h_entries[s],
                             (size_t)nactive * sizeof(ActiveEntry),
-                            cudaMemcpyHostToDevice, ctx.stream);
+                            cudaMemcpyHostToDevice, stm);
             const int warps = 4;
             dim3 grid((ngroups + warps - 1) / warps, nactive);
             if (ctx.is_f64)
-                interp_kernel<double2><<<grid, 32 * warps, 0, ctx.stream>>>(
-                    (double2 *)ctx.d_ftprofs, (const float2 *)ctx.d_amps,
-                    ctx.namps, ctx.nh, i0, n, ctx.d_plans, ctx.d_entries,
+                interp_kernel<double2><<<grid, 32 * warps, 0, stm>>>(
+                    (double2 *)ctx.d_ftprofs[s], (const float2 *)ctx.d_amps,
+                    ctx.namps, ctx.nh, i0, n, ctx.d_plans, ctx.d_entries[s],
                     g0, ngroups);
             else
-                interp_kernel<float2><<<grid, 32 * warps, 0, ctx.stream>>>(
-                    (float2 *)ctx.d_ftprofs, (const float2 *)ctx.d_amps,
-                    ctx.namps, ctx.nh, i0, n, ctx.d_plans, ctx.d_entries,
+                interp_kernel<float2><<<grid, 32 * warps, 0, stm>>>(
+                    (float2 *)ctx.d_ftprofs[s], (const float2 *)ctx.d_amps,
+                    ctx.namps, ctx.nh, i0, n, ctx.d_plans, ctx.d_entries[s],
                     g0, ngroups);
         }
 
-        GPUDBG("  interp launched\n");
         /* base fold */
         if (ctx.is_f64)
-            cufftExecZ2D(ctx.plan_base,
-                         (cufftDoubleComplex *)ctx.d_ftprofs,
-                         (double *)ctx.d_profs);
+            cufftExecZ2D(ctx.plan_base[s],
+                         (cufftDoubleComplex *)ctx.d_ftprofs[s],
+                         (double *)ctx.d_profs[s]);
         else
-            cufftExecC2R(ctx.plan_base,
-                         (cufftComplex *)ctx.d_ftprofs,
-                         (float *)ctx.d_profs);
+            cufftExecC2R(ctx.plan_base[s],
+                         (cufftComplex *)ctx.d_ftprofs[s],
+                         (float *)ctx.d_profs[s]);
 
-        GPUDBG("  base fft ok\n");
-        double sig = analytic_sigma(ctx.h_filled, 1, ctx.nh);
-        int nf = 0;
-        { int h; for (h = 1; h <= ctx.nh; h++) nf += ctx.h_filled[h - 1] ? 1 : 0; }
-        if (ctx.base_shapeH != nf) {
-            boxcar_shape(ctx.h_shapes, ctx.nbins, ctx.h_widths_base, ctx.nw_base,
-                         ctx.h_filled, 1, ctx.nh);
-            cudaMemcpyAsync(ctx.d_shape_base, ctx.h_shapes,
+        double sig = ctx.sig_base_r;
+        int nf = ctx.nfd_base_r;
+        if (ctx.base_shapeH[s] != nf) {
+            boxcar_shape(ctx.h_shapes[s], ctx.nbins, ctx.h_widths_base,
+                         ctx.nw_base, ctx.h_filled, 1, ctx.nh);
+            cudaMemcpyAsync(ctx.d_shape_base[s], ctx.h_shapes[s],
                             (size_t)ctx.nw_base * sizeof(double),
-                            cudaMemcpyHostToDevice, ctx.stream);
-            ctx.base_shapeH = nf;
+                            cudaMemcpyHostToDevice, stm);
+            ctx.base_shapeH[s] = nf;
         }
         if (ctx.is_f64) {
             double sigp = sig, invsigma = sigp > 0.0 ? 1.0 / sigp : 0.0;
-            launch_metric<double>(&ctx, 0, ctx.nbins, n, ctx.d_widths_base,
+            launch_metric<double>(&ctx, s, 0, ctx.nbins, n, ctx.d_widths_base,
                                   ctx.nw_base, ctx.wmax_base, invsigma,
-                                  ctx.d_shape_base, threshold);
+                                  ctx.d_shape_base[s], threshold);
         } else {
             float sigp = (float)sig, invsigma = sigp > 0.0f ? 1.0f / sigp : 0.0f;
-            launch_metric<float>(&ctx, 0, ctx.nbins, n, ctx.d_widths_base,
+            launch_metric<float>(&ctx, s, 0, ctx.nbins, n, ctx.d_widths_base,
                                  ctx.nw_base, ctx.wmax_base, invsigma,
-                                 ctx.d_shape_base, threshold);
+                                 ctx.d_shape_base[s], threshold);
+        }
+
+        /* Decimations with k | nharms: one kernel folds each of them straight
+         * out of the base profile's prefix sums, so no dprofs is written or
+         * read back.  Non-divisor k still use cuFFT + metric_kernel below. */
+        if (ctx.nfold > 0) {
+            int nfd_tot = 0, shape_dirty = 0;
+            { int d; for (d = 0; d < ndec; d++) {
+                GpuDecim *dd = &ctx.decims[d];
+                if (!dd->fold) continue;
+                int nvalid;
+                { int lo = 0, hi = n;
+                  while (lo < hi) {
+                      int mid = lo + ((hi - lo) >> 1);
+                      if ((double)dd->k * (rstart + (double)mid * lodr) < nyq)
+                          lo = mid + 1;
+                      else hi = mid;
+                  }
+                  nvalid = lo; }
+                if (nvalid <= 0) continue;
+                sig = ctx.sig_decim_r[d];
+                int nfd = ctx.nfd_decim_r[d];
+                if (dd->shapeH[s] != nfd) {
+                    boxcar_shape(ctx.h_fshape[s] + dd->soff, dd->nbins,
+                                 dd->h_widths, dd->nw, ctx.h_filled,
+                                 dd->k, dd->Hk);
+                    dd->shapeH[s] = nfd;
+                    shape_dirty = 1;
+                }
+                FoldK F;
+                F.k = dd->k; F.nk = dd->nbins; F.nw = dd->nw; F.wmax = dd->wmax;
+                F.woff = dd->woff; F.soff = dd->soff;
+                F.nvalid = nvalid; F.slot = dd->slot;
+                F.invsigma = sig > 0.0 ? 1.0 / sig : 0.0;
+                ctx.h_fold[s][nfd_tot++] = F;
+            } }
+            if (nfd_tot > 0) {
+                cudaMemcpyAsync(ctx.d_fold[s], ctx.h_fold[s],
+                                (size_t)nfd_tot * sizeof(FoldK),
+                                cudaMemcpyHostToDevice, stm);
+                if (shape_dirty)
+                    cudaMemcpyAsync(ctx.d_fshape[s], ctx.h_fshape[s],
+                                    (size_t)ctx.fshape_n * sizeof(double),
+                                    cudaMemcpyHostToDevice, stm);
+                const int grid_f = (n + 31) / 32;
+                if (ctx.is_f64)
+                    fold_metric_kernel<double><<<grid_f, 32, ctx.fold_shared, stm>>>(
+                        (const double *)ctx.d_profs[s], ctx.nbins, n,
+                        ctx.d_fold[s], nfd_tot, ctx.d_foldw, ctx.d_fshape[s],
+                        ctx.d_counts[s], (CandRec<double> *)ctx.d_records[s],
+                        ctx.Nprof, threshold);
+                else
+                    fold_metric_kernel<float><<<grid_f, 32, ctx.fold_shared, stm>>>(
+                        (const float *)ctx.d_profs[s], ctx.nbins, n,
+                        ctx.d_fold[s], nfd_tot, ctx.d_foldw, ctx.d_fshape[s],
+                        ctx.d_counts[s], (CandRec<float> *)ctx.d_records[s],
+                        ctx.Nprof, threshold);
+            }
         }
 
         /* decimated folds */
         { int d; for (d = 0; d < ndec; d++) {
             GpuDecim *dd = &ctx.decims[d];
-            int nvalid = 0;
-            while (nvalid < n &&
-                   (double)dd->k * (rstart + (double)nvalid * lodr) < nyq)
-                nvalid++;
+            if (dd->fold) continue;
+            int nvalid;
+            { int lo = 0, hi = n;
+              while (lo < hi) {
+                  int mid = lo + ((hi - lo) >> 1);
+                  if ((double)dd->k * (rstart + (double)mid * lodr) < nyq)
+                      lo = mid + 1;
+                  else hi = mid;
+              }
+              nvalid = lo; }
             if (nvalid <= 0) continue;
 
-            double *shape = ctx.h_shapes + (size_t)(d + 1) * ctx.max_nw;
-            sig = analytic_sigma(ctx.h_filled, dd->k, dd->Hk);
-            int nfd = 0;
-            { int h; for (h = 1; h <= dd->Hk; h++)
-                nfd += ctx.h_filled[h * dd->k - 1] ? 1 : 0; }
-            if (dd->shapeH != nfd) {
+            double *shape = ctx.h_shapes[s] + (size_t)(d + 1) * ctx.max_nw;
+            sig = ctx.sig_decim_r[d];
+            int nfd = ctx.nfd_decim_r[d];
+            if (dd->shapeH[s] != nfd) {
                 boxcar_shape(shape, dd->nbins, dd->h_widths, dd->nw,
                              ctx.h_filled, dd->k, dd->Hk);
-                cudaMemcpyAsync(dd->d_shape, shape,
+                cudaMemcpyAsync(dd->d_shape[s], shape,
                                 (size_t)dd->nw * sizeof(double),
-                                cudaMemcpyHostToDevice, ctx.stream);
-                dd->shapeH = nfd;
+                                cudaMemcpyHostToDevice, stm);
+                dd->shapeH[s] = nfd;
             }
 
             if (ctx.is_f64)
-                cufftExecZ2D(dd->plan,
-                             (cufftDoubleComplex *)ctx.d_ftprofs,
-                             (double *)dd->d_dprofs);
+                cufftExecZ2D(dd->plan[s],
+                             (cufftDoubleComplex *)ctx.d_ftprofs[s],
+                             (double *)dd->d_dprofs[s]);
             else
-                cufftExecC2R(dd->plan,
-                             (cufftComplex *)ctx.d_ftprofs,
-                             (float *)dd->d_dprofs);
+                cufftExecC2R(dd->plan[s],
+                             (cufftComplex *)ctx.d_ftprofs[s],
+                             (float *)dd->d_dprofs[s]);
 
             if (ctx.is_f64) {
                 double sigp = sig, invsigma = sigp > 0.0 ? 1.0 / sigp : 0.0;
-                launch_metric<double>(&ctx, d + 1, dd->nbins, nvalid,
+                launch_metric<double>(&ctx, s, d + 1, dd->nbins, nvalid,
                                       dd->d_widths, dd->nw, dd->wmax,
-                                      invsigma, dd->d_shape, threshold);
+                                      invsigma, dd->d_shape[s], threshold);
             } else {
                 float sigp = (float)sig, invsigma = sigp > 0.0f ? 1.0f / sigp : 0.0f;
-                launch_metric<float>(&ctx, d + 1, dd->nbins, nvalid,
+                launch_metric<float>(&ctx, s, d + 1, dd->nbins, nvalid,
                                      dd->d_widths, dd->nw, dd->wmax,
-                                     invsigma, dd->d_shape, threshold);
+                                     invsigma, dd->d_shape[s], threshold);
             }
         } }
 
-        GPUDBG("  decims launched, waiting for counts\n");
-        /* Blocking copy on the legacy default stream: it waits for the
-         * blocking compute stream, so the kernels (and their candidate-record
-         * writes into mapped host memory) are complete when it returns.
-         * No explicit stream-synchronization call is needed. */
-        cudaMemcpy(ctx.h_counts, ctx.d_counts,
-                   (size_t)(ndec + 1) * sizeof(int),
-                   cudaMemcpyDeviceToHost);
-        GPUDBG("  chunk %lld done, cands=%zu\n", c, cands.n);
+        /* Async count readback; the event marks the slot reusable. */
+        cudaMemcpyAsync(ctx.h_counts[s], ctx.d_counts[s],
+                        (size_t)(ndec + 1) * sizeof(int),
+                        cudaMemcpyDeviceToHost, stm);
+        cudaEventRecord(ctx.ev[s], stm);
+    }
 
+    /* Drain and harvest the last CS_GPU_NST chunks. */
+    for (long long c = (nchunks > CS_GPU_NST ? nchunks - CS_GPU_NST : 0);
+         c < nchunks; c++) {
+        const int s = (int)(c % CS_GPU_NST);
+        cudaEventSynchronize(ctx.ev[s]);
+        const double rstartp = rst_ring[s];
         int cnts[64];
         { int sl; for (sl = 0; sl <= ndec && sl < 64; sl++) {
-            cnts[sl] = ctx.h_counts[sl];
+            cnts[sl] = ctx.h_counts[s][sl];
             if (cnts[sl] > Nprof) cnts[sl] = Nprof;
         } }
-
         { int sl; for (sl = 0; sl <= ndec && sl < 64; sl++) {
             int cnt = cnts[sl];
             if (cnt <= 0) continue;
-            char *base = (char *)ctx.h_records +
+            char *base = (char *)ctx.h_records[s] +
                          (size_t)sl * Nprof * ctx.rec_size;
-            if (sl == 0) {
-                CandRec<float> *rf = (CandRec<float> *)base;
-                CandRec<double> *rd = (CandRec<double> *)base;
-                if (ctx.is_f64) qsort(rd, (size_t)cnt, ctx.rec_size, rec_cmp_d);
-                else qsort(rf, (size_t)cnt, ctx.rec_size, rec_cmp_f);
-                { int q; for (q = 0; q < cnt; q++) {
-                    int j = ctx.is_f64 ? rd[q].j : rf[q].j;
-                    double metric = ctx.is_f64 ? rd[q].m : (double)rf[q].m;
-                    if (!(metric > threshold)) continue;
-                    double rfreq = rstart + (double)j * lodr;
-                    Candidate cd;
-                    cd.freq = rfreq / ft->T;
-                    cd.metric = metric;
-                    cd.r = rfreq;
-                    cd.nharm = ctx.nh;
-                    cd.ducy = NAN;
-                    candlist_push(&cands, cd);
-                } }
-            } else {
-                int d = sl - 1;
-                GpuDecim *dd = &ctx.decims[d];
-                CandRec<float> *rf = (CandRec<float> *)base;
-                CandRec<double> *rd = (CandRec<double> *)base;
-                if (ctx.is_f64) qsort(rd, (size_t)cnt, ctx.rec_size, rec_cmp_d);
-                else qsort(rf, (size_t)cnt, ctx.rec_size, rec_cmp_f);
-                { int q; for (q = 0; q < cnt; q++) {
-                    int j = ctx.is_f64 ? rd[q].j : rf[q].j;
-                    double metric = ctx.is_f64 ? rd[q].m : (double)rf[q].m;
-                    if (!(metric > threshold)) continue;
-                    double r_dec = (double)dd->k *
-                                   (rstart + (double)j * lodr);
-                    if (!(r_dec < nyq)) continue;
-                    Candidate cd;
-                    cd.freq = r_dec / ft->T;
-                    cd.metric = metric;
-                    cd.r = r_dec;
-                    cd.nharm = dd->Hk;
-                    cd.ducy = NAN;
-                    candlist_push(&cands, cd);
-                } }
+            CandRec<float> *rf = (CandRec<float> *)base;
+            CandRec<double> *rd = (CandRec<double> *)base;
+            if (ctx.is_f64) qsort(rd, (size_t)cnt, ctx.rec_size, rec_cmp_d);
+            else qsort(rf, (size_t)cnt, ctx.rec_size, rec_cmp_f);
+            int kh = ctx.nh;
+            double kmul = 1.0;
+            if (sl != 0) {
+                kh = ctx.decims[sl - 1].Hk;
+                kmul = (double)ctx.decims[sl - 1].k;
             }
+            { int q; for (q = 0; q < cnt; q++) {
+                int j = ctx.is_f64 ? rd[q].j : rf[q].j;
+                double metric = ctx.is_f64 ? rd[q].m : (double)rf[q].m;
+                if (!(metric > threshold)) continue;
+                double rfreq = rstartp + (double)j * lodr;
+                double rsel = kmul != 1.0 ? kmul * rfreq : rfreq;
+                if (sl != 0) {
+                    if (!(rsel < nyq)) continue;
+                }
+                Candidate cd;
+                cd.freq = rsel / ft->T;
+                cd.metric = metric;
+                cd.r = rsel;
+                cd.nharm = kh;
+                cd.ducy = NAN;
+                candlist_push(&cands, cd);
+            } }
         } }
-
-        if (progress_mode != 0) {
-            double frac = nchunks == 0 ? 1.0 : (double)(c + 1) / (double)nchunks;
-            int pct = (int)llround(100.0 * frac);
-            if (progress_mode == 2) {
-                int filled = (int)llround(40.0 * frac);
-                if (filled < 0) filled = 0;
-                if (filled > 40) filled = 40;
-                fprintf(stderr, "\r  Searching [");
-                { int i; for (i = 0; i < filled; i++) fputc('#', stderr); }
-                { int i; for (i = filled; i < 40; i++) fputc(' ', stderr); }
-                fprintf(stderr, "] %3d%%  (%lld/%lld chunks)", pct, c + 1, nchunks);
-            } else {
-                fprintf(stderr, "\r  Searching: %3d%%  (%lld/%lld chunks)",
-                        pct, c + 1, nchunks);
-            }
-            fflush(stderr);
-        }
-    } }
-    if (progress_mode != 0) fprintf(stderr, "\n");
+    }
     return cands;
 }
 
@@ -811,33 +1180,56 @@ extern "C" void cs_gpu_session_free(GpuSession *S)
     if (!S) return;
     GpuCtx &ctx = S->ctx;
     const int ndec = S->ndec;
-    /* cleanup: the last chunk's blocking count copy already completed all
-     * stream work; cudaStreamDestroy/cudaFree handle any remaining teardown. */
-    cudaFree(ctx.d_counts);
-    cudaFreeHost(ctx.h_counts);
-    cudaFreeHost(ctx.h_records);   /* also releases the mapped device view */
+    { int s; for (s = 0; s < CS_GPU_NST; s++) {
+        cudaFree(ctx.d_counts[s]);
+        cudaFreeHost(ctx.h_counts[s]);
+        cudaFreeHost(ctx.h_records[s]);   /* also releases the mapped view */
+        cudaFree(ctx.d_entries[s]);
+        cudaFreeHost(ctx.h_entries[s]);
+        cudaFree(ctx.d_zerocols[s]);
+        cudaFreeHost(ctx.h_zerocols[s]);
+        free(ctx.h_shapes[s]);
+        cudaFree(ctx.d_shape_base[s]);
+        cudaFree(ctx.d_ftprofs[s]);
+        cudaFree(ctx.d_profs[s]);
+    } }
+    free(ctx.h_filled);
+    free(ctx.h_filled_prev);
+    free(ctx.sig_decim_r);
+    free(ctx.nfd_decim_r);
     { int i; for (i = 0; i < ndec; i++) {
-        cufftDestroy(ctx.decims[i].plan);
+        if (!ctx.decims[i].fold) {
+            { int s; for (s = 0; s < CS_GPU_NST; s++)
+                cufftDestroy(ctx.decims[i].plan[s]); }
+            { int s; for (s = 0; s < CS_GPU_NST; s++)
+                cudaFree(ctx.decims[i].d_dprofs[s]); }
+        }
         cudaFree(ctx.decims[i].d_widths);
         free(ctx.decims[i].h_widths);
-        cudaFree(ctx.decims[i].d_shape);
-        cudaFree(ctx.decims[i].d_dprofs);
+        { int s; for (s = 0; s < CS_GPU_NST; s++)
+            cudaFree(ctx.decims[i].d_shape[s]); }
+    } }
+    { int s; for (s = 0; s < CS_GPU_NST; s++) {
+        if (ctx.h_fold[s]) cudaFreeHost(ctx.h_fold[s]);
+        cudaFree(ctx.d_fold[s]);
+        if (ctx.h_fshape[s]) cudaFreeHost(ctx.h_fshape[s]);
+        cudaFree(ctx.d_fshape[s]);
     } }
     free(ctx.decims);
-    cufftDestroy(ctx.plan_base);
-    cudaFree(ctx.d_shape_base);
+    { int s; for (s = 0; s < CS_GPU_NST; s++)
+        cufftDestroy(ctx.plan_base[s]); }
     cudaFree(ctx.d_widths_base);
     free(ctx.h_widths_base);
-    cudaFree(ctx.d_entries);
-    free(ctx.h_entries);
-    free(ctx.h_filled);
-    free(ctx.h_shapes);
     free_plans(ctx.h_plans, ctx.nh);
+    cudaFree(ctx.d_plans_arena);
     cudaFree(ctx.d_plans);
-    cudaFree(ctx.d_ftprofs);
-    cudaFree(ctx.d_profs);
     cudaFree(ctx.d_amps);
-    cudaStreamDestroy(ctx.stream);
+    if (ctx.h_foldw) free(ctx.h_foldw);
+    cudaFree(ctx.d_foldw);
+    { int s; for (s = 0; s < CS_GPU_NST; s++) {
+        cudaEventDestroy(ctx.ev[s]);
+        cudaStreamDestroy(ctx.st[s]);
+    } }
     free(S->cstarts);
     free(S);
 }
@@ -847,7 +1239,7 @@ extern "C" CandidateList cs_gpu_search_region(
         const FFTFile *ft, const SearchParams *p,
         const DirectPlanSet *dplans, const long long *cstarts, long long total,
         int Nprof, long long nchunks, double r_lo, double r_hi, double lodr,
-        double threshold, int progress_mode, int device)
+        double threshold, int device)
 {
     (void)r_hi;
     GpuSession *S = cs_gpu_session_create(ft, p, dplans, cstarts, total, Nprof,
@@ -857,7 +1249,7 @@ extern "C" CandidateList cs_gpu_search_region(
         candlist_init(&empty);
         return empty;
     }
-    CandidateList c = cs_gpu_session_run(S, ft, threshold, progress_mode);
+    CandidateList c = cs_gpu_session_run(S, ft, threshold);
     cs_gpu_session_free(S);
     return c;
 }

@@ -113,8 +113,8 @@ The command line mirrors the Julia program:
     --numharm N          harmonic-collapse depth (default 16)
     --noremove           keep near-identical candidates
     --noharmremove       keep harmonically-related candidates
-    --progressbar        bar instead of the text percentage
-    --noprogress         no progress meter
+    --progressbar        accepted for compatibility (progress output is off)
+    --noprogress         accepted for compatibility (progress output is off)
 -v, --verbose            print the trial grid and plan details
     --metricstats        write per-block/per-decimation metric statistics
     --normalize          two-pass adaptive threshold (metric in sigma units)
@@ -395,7 +395,6 @@ took 8.5 s with CPU search and 3.1 s with GPU search; a long-N command
 the log confirmed `Read cache file ..._cac0`, and no `.dat` or `.dat.list`
 files were created.
 
-
 ## What is implemented
 
 - PRESTO `.inf` / `.fft` readers, mmap of the amplitudes.
@@ -411,7 +410,8 @@ files were created.
   and the trials-axis (`V = 32`) interpolation kernel of the Julia production
   path, including the `Float32` weights and the non-rational fallback.
 - Batched complex-to-real FFTs (FFTW) for the base fold and for **strided**
-  harmonic-decimation views `k = 2..maxdecim`.
+  harmonic-decimation views `k = 2..maxdecim`; when `k` divides `nharms` the
+  decimated profile is instead an exact fold of the base profile (no FFT).
 - An optional CUDA backend (`make GPU=1`, `--gpu [N]`): the same interpolation
   tables drive a warp-per-group kernel, cuFFT does the batched inverse
   transforms, and an exact per-profile boxcar kernel produces the metrics.
@@ -579,6 +579,106 @@ Further optimisations in this version:
 - the `.dat` pipeline creates the inverse FFTW plan only to reproduce PRESTO's
   forward-plan choice, then releases it immediately (it is never executed).
 
+A second optimisation round (all bit-identical to the previous output; every
+timing below is the 50-file `G29.02` DM sweep, `-n 32 -t 6 --maxdecim 16`,
+single-threaded host unless noted):
+
+- the CPU interpolator now writes its rotated values into an **h-major
+  spectrum buffer** (element `(h, j)` at `h*Nprof + j`): one contiguous 256 B
+  store per warp-equivalent group instead of 32 complex scatter writes with a
+  976 B stride, and the DC/inactive-harmonic zero fill becomes one `memset`
+  per row.  FFTW keeps bit-identical arithmetic with the strided input
+  (`istride=Nprof`, `idist=1`), about 6% slower per transform than the
+  trial-major layout but far cheaper overall than the stores it replaces
+  (fill stage 0.41 -> 0.29 s per file; whole CPU search -13%);
+- the batched boxcar gate is **tiled by 32 profiles**: the transposed prefix
+  sums plus the 32 source columns (~31 KB) stay resident in L1D while the
+  ladder widths are scanned, instead of streaming the whole 65+ KB batch
+  through L1D for every width;
+- the per-trial candidate scan of both the base pass and every decimation is
+  AVX-512 vectorised with the exact per-element arithmetic (exact
+  integer->double conversion, one multiply, one add; hits replayed in
+  ascending trial order), and the `nvalid` Nyquist count in each decimation
+  pass is a bisection on the same monotone predicate instead of a linear
+  scan;
+- the GPU session executes **consecutive chunks on three CUDA streams** with
+  double-buffered spectra, profiles, decimated profiles, candidate records,
+  counts and upload staging per stream: kernel launches, the analytic-shape
+  updates and the candidate readback of chunk *c* overlap chunk *c+1*'s
+  kernels, and the metric kernels co-execute (they were previously limited to
+  2 resident warps per SM at `--blocksize 8192`).  Counts return through an
+  async pinned copy plus one event per chunk -- no blocking copy, no device
+  idle between chunks (GPU list run 3.99 -> 2.6 s at 8192, 11.8 -> 6.7 s at
+  2048);
+- all harmonic plan tables are uploaded as **one packed device arena** (two
+  `cudaMalloc`s and two copies instead of ~660) and the cuFFT plans are
+  switched per stream with `cufftSetStream` instead of being bound to one
+  stream.
+
+Measured effect on the full 50-file sweep (single process, `OMP_NUM_THREADS=1`;
+GPU rows are `--gpu 0`, block sizes as marked):
+
+| configuration | before | after |
+|---|---:|---:|
+| GPU list, blocksize 8192 | 3.99 s | **2.62 s** |
+| GPU list, blocksize 2048 | 11.81 s | **6.67 s** |
+| `prep_coherent_search`, 8192 / 2048 | 10.7 / 18.7 s | **9.0 / 13.2 s** |
+| CPU list, 8192 / 2048 | 73.7 / 73.6 s | **64.1 / 61.3 s** |
+| CPU `prep_coherent_search`, 8192 | 78.6 s | **70.7 s** |
+
+Every `.cohout` file of every configuration above is byte-identical to the
+pre-change output (CPU, GPU, f32/f64, `--sigma measured`, `--normalize`,
+`--noremove/--noharmremove`, other `--blocksize/--nharms/--maxdecim/--hidr`
+values included).
+
+A third round kept the byte-identical guarantee and pushed the same sweep to
+
+| configuration | second round | third round |
+|---|---:|---:|
+| GPU list, blocksize 8192 | 2.62 s | **2.49 s** |
+| GPU list, blocksize 2048 | 6.67 s | **6.39 s** |
+| `prep_coherent_search`, 8192 / 2048 | 9.0 / 13.2 s | **8.9 / 12.7 s** |
+| CPU list, 8192 / 2048 | 64.1 / 61.3 s | **63.6 / 61.9 s** |
+| CPU `prep_coherent_search`, 8192 | 70.7 s | **68.9 s** |
+
+- **GPU region cache**: the filled-harmonic pattern is constant between the
+  change points the chunk table already splits on, so per region the analytic
+  sigmas (base and every decimation) are computed once instead of sixteen
+  times per chunk.  (Also skipping the zero-columns upload/kernel per region
+  was tried and **reverted**: cuFFT's C2R destroys its input array even
+  out-of-place, so the inactive/DC columns are clobbered by every exec and
+  must be re-zeroed each chunk -- skipping it corrupted ~37% of the files in
+  a 10850-file sweep.  The same sweep caught it: the per-stream pipeline made
+  a full-scale correctness campaign worthwhile.  Each stream now also owns
+  its own cuFFT plan copies, because a plan's work area is shared state and
+  concurrent executions of one plan on different streams could race.)
+- the **f32 gate re-scan was removed**: the batched f32 gate is bit-identical
+  to the scalar per-profile filter (verified exhaustively -- 80.4 M metric
+  comparisons on one observation, 0 mismatches), so re-computing candidates
+  above `exactcut` was pure waste.  The f64 gate keeps its re-scan (it
+  accumulates through a float `psT` and is approximate);
+- the CPU interpolator's tap loop now runs **two groups per pass** (eight
+  live FMA chains), halving the latency-bound iterations; each group's FMA
+  order is unchanged.
+
+Three further GPU restructurings were implemented, measured and reverted
+because they lost to the three-stream overlap already in place: splitting
+`fold_metric_kernel` per decimation (3.51 s vs 2.65), merging the eight
+`metric_kernel` launches into one (2.97 s), and a two-group interpolation
+kernel (2.67 s).
+
+Full-scale campaign (157 lists / 10850 `.dat` files, 293 GB, same options as
+the small sweep): the GPU list driver is the fastest deployment at **558 s
+serial**; eight parallel list processes are identical (520-558 s -- the GPU
+is saturated by one process), per-file `coherent_search` at `-P 8` costs
+1145 s (about 57 ms/process startup overhead, partly amortised), and `-P 16`
+is slightly worse than `-P 8`.  On the CPU (`--blocksize 2048`), `-P 16`
+takes 3190 s while `-P 8` takes 2058 s: past ~8 processes the memory
+bandwidth wall dominates (per-core efficiency drops to ~1/4 at 16), so
+8-12 processes are the sweet spot there.  All outputs verified against the
+pre-optimisation binaries (0 differing files in sampled spot checks across
+the three option sets, after the cuFFT-input fix above).
+
 A hand-written AVX-512 assembly version of the boxcar scan was also implemented
 and benchmarked.  It produced bit-identical results but ran ~17% slower than the
 compiler's intrinsics (22.8 s vs 26.8 s on the 105-file list), so it was removed:
@@ -631,12 +731,16 @@ Other MPS experiments did not help: switching to a non-blocking stream/async
 count copy, `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=12`, and an L2 streaming access
 policy all left the 65536 multi-process time at 58-71 s.
 
-Progress printing is not a measurable cost here.  On the same 664-file subset,
-`--noprogress` took 40.03 s, default progress to `/dev/null` 40.05 s, to a log
-file 40.02 s, and through a pseudo-terminal 40.18 s.  A test build with the
-per-chunk progress branch and all intermediate `Info:` prints compiled out took
-40.07 s, so the `if` checks and formatting are not the bottleneck.  Keep the
-diagnostics; `--noprogress` only reduces log size.
+Progress printing was never a measurable cost here, but it made long list runs
+unreadable, so it is now gone: the per-chunk meter and all intermediate
+per-file/per-pass `Info:` lines have been removed.  The programs are quiet by
+default and print only errors, warnings, the `-v` plan report and the
+`--metricstats` report (the latter two are the requested output).  On the same
+664-file subset, `--noprogress` took 40.03 s and default progress to `/dev/null`
+40.05 s; a test build with the per-chunk branch and all `Info:` prints compiled
+out took 40.07 s, so the checks and formatting were never the bottleneck.
+`--noprogress`/`--progressbar` are still accepted and ignored, so existing
+command lines (including `test.sh`) keep working.
 
 The one-process combined run produced the same 6,735 `.cohout` files, all
 byte-identical to the eight-process 65536 outputs.  For exact output on one GPU,
@@ -677,6 +781,182 @@ The original CPU optimisations that got there:
 2. an explicit AVX2 boxcar scan — GCC's auto-vectorised form was 2.4-4.8x slower;
 3. a fused transpose+prefix-sum pass that writes already-transposed prefix sums
    into `psT`, removing the intermediate `(B, nbins)` tile and its memory traffic.
+
+A later pass added four more changes, measured on the same 305 s observation
+(`-n 60 --maxdecim 16`, one thread; the per-phase figures below were taken
+with temporary timers that are not part of the shipped build):
+
+4. an exact algebraic shortcut for the decimated inverse FFTs.  Harmonic
+   subsampling by `k` is a time-domain fold, so for `k | nharms` the c2r of the
+   strided stack is exactly the `k`-fold average of the full-resolution
+   profile: `r_k[j] = (1/k) * sum_{q<k} r_full[j + q*n_k]`.  Those profiles are
+   now produced by an AVX-512 fold of `ws->profs`; the corresponding FFTW plans
+   are not created at all, and the non-divisor `k` keep FFTW.  Decimated
+   inverse FFTs: 0.64 s -> 0.34 s.  `fold_decims()` then produces *all* eight
+   foldable decimations in one pass over the base profile, so each 120-float
+   row is read once instead of once per decimation (8 MB -> 1 MB of source
+   traffic per chunk); this took the decimated transform phase to ~0.20 s and
+   the single-observation wall time from 1.44 s to 1.33 s.
+5. the boxcar scan loops over positions on the outside and ladder widths on the
+   inside, loading `psT[p-1]` once per position instead of twice per width.
+   `max` is exact and order-free, so no value changes.  Scan: 0.28 s -> 0.19 s.
+6. the fused transpose+prefix pass now builds **16-wide** prefix chains: two
+   8x8 AVX2 register transposes (unpack/shuffle/permute2f128, all cheap moves)
+   are joined with `vinsertf32x8`, so each chain drives 16 profiles and every
+   `psT` store is a full 64-byte cache line instead of half of one.  The
+   prefix adds are the same adds in the same order, so `psT` stays
+   bit-identical.  Transpose: 0.31 s -> 0.16 s.  Three implementations were
+   benchmarked on the same shapes and all produced bit-identical `psT`
+   (maxerr 0): two 8x8 + `vinsertf32x8` 60 us, the previous 8x8 pair 62 us,
+   a 16x16 AVX-512 bit-swap transpose 114 us, and PRESTO's FFTW rank-0 r2r
+   "transpose trick" (`fftwf_plan_guru_r2r` with zero rank, as used by
+   `transpose.c` in dedispersion) 794 us.  The bit-swap version loses because
+   `vpermt2ps` is expensive on Zen 5; the FFTW trick loses because it
+   materialises the transposed tile (an extra read and write of every batch)
+   while the fused pass transposes and prefixes in a single traversal.  In
+   situ the win is larger than the hot-cache microbenchmark suggests, because
+   the full-line stores also remove the read-for-ownership traffic.
+7. an AVX-512 path for the interpolation group kernel (four live 16-lane
+   accumulators; same per-element FMA order as the 8-lane path), an AVX-512
+   de-interleave of the amplitude window (`vpermt2ps` instead of 32 scalar
+   moves per 16 complex) and a 16-wide complex rotate for fully interior
+   groups.  Interpolation: 0.42 s -> 0.38 s.
+8. the interpolation table sizes were measured while evaluating this step:
+   `gW` (the per-group expanded weights) is 1.71 MB in total and the compact
+   per-harmonic `W[p][i]` table 0.19 MB, with the group count `ngrp` between 1
+   and 15 per harmonic (`ngrp = q/gcd(V*s, q)`, not `q`).
+   That answers the obvious question: replacing `gW` by the compact table
+   would need a 32-way gather per tap, and a `vgatherdps` pair costs ~5-12
+   cycles where the two contiguous 64-byte loads cost ~1, i.e. an order of
+   magnitude worse for a 1.5 MB saving that already fits L3.  Measured and
+   rejected.
+
+Ablating the interpolation pass (with temporary instrumentation) splits its
+0.416 s as
+FMA accumulation 0.157, complex rotate + scattered stores 0.139, amplitude
+window copy 0.039, plan bookkeeping and zero padding 0.034, with the rest in
+interactions.  The stores are the part that is not instruction-bound: each
+group writes 32 eight-byte complex values at a 488-byte stride, so a trial's
+61 columns need eight separate harmonic passes and every 8-byte store re-reads
+its cache line for ownership.  The fix is a harmonic-block x trial-group tile
+(eight harmonics fill exactly one 64-byte line of a trial) so each line is
+written once, but the row length of `nharms+1` complex makes the block starts
+shift by 40 bytes per trial, so the flush must be done with unaligned 64-byte
+stores; the estimated gain is ~0.1 s and the restructuring is invasive, so it
+is left as the next step rather than done here.
+
+End to end, the 105-file DM list at `--threads 1` went from 215.3 s to 146.7 s
+(-32%), and a single 305 s observation from 2.06 s to 1.33 s (-35%), with
+byte-identical `.cohout` files on all 105 inputs; at 8 threads the same file
+went from 0.29 s to 0.22 s.  Phase totals for that observation are now
+interp 0.38, base FFT 0.23, base metric 0.11, decimated FFTs 0.34, decimated
+metrics 0.27 s (1.90 s before), and the boxcar gate is transpose 0.15 +
+scan 0.19 s.  A `--blocksize` sweep from 256 to 8192 on that observation gave
+1.40-1.50 s with identical candidates, so the default stays at 2048.  `--precision f64`, `--sigma measured`,
+`--blocksize 512/2048/8192` and `--maxdecim 4/7` were also diffed against the
+previous binary and are unchanged.
+
+The GPU path gained two changes:
+
+- the per-chunk full memset of `d_ftprofs` (32 MB at the default GPU block
+  size) was replaced by a kernel that zeroes only the columns the
+  interpolation pass does not write (DC plus the harmonics that do not fit the
+  chunk), matching `fill_chunk_profiles` on the CPU.  105-file list:
+  5.72 s -> 5.63 s.
+- `fold_metric_kernel` fuses the fold and the boxcar metric for every
+  decimation with `k | nharms` (8 of the 15).  It builds the base prefix sums
+  once in shared memory, derives each folded prefix with
+  `pf[m] = (1/k) * sum_q (P[m+q*nk] - P[q*nk])` plus the cyclic tail
+  `pf[nk+u] = pf[nk] + pf[u]`, and runs the same window scan as
+  `metric_kernel`.  The decimated profile never exists in global memory, and
+  those decimations create no cuFFT plan or `dprofs` buffer at all.  The
+  decimated phase fell from 28.9 ms to 26.9 ms per 305 s observation and the
+  105-file list from 5.63 s to 5.39 s (5.35 s after the CPU boxcar change),
+  with byte-identical `.cohout` files;
+  the smaller startup (7 cuFFT plans instead of 15) is what shows up most on
+  single-file runs.  The kernel needs f32 and ~24 KB of shared memory per
+  block; with `--precision f64`, or when the shared-memory budget is short,
+  every decimation falls back to cuFFT + `metric_kernel`.  Two variants were
+  measured and rejected: dropping the shared base prefix and folding from L1
+  was 2.8x slower on the decimated phase (75.0 ms), and folding only
+  `k <= 8` was slower than folding all divisors (27.6 ms vs 26.9 ms).
+
+Where each optimisation transfers, checked one by one:
+
+- **exact fold.**  Only the decimated transforms subsample a spectrum, so there
+  is nothing else to fold.  `candidate_profile` rebuilds one profile by direct
+  interpolation, not an FFT, and the base transform has no sub-spectrum.
+- **scan loop interchange.**  Transfers to the CPU gate (done).  It does *not*
+  transfer to the GPU `metric_kernel`/`fold_metric_kernel`: with the
+  accumulators unrolled to a compile-time bound, the predicated-off iterations
+  still consume issue slots, and at nw = 4..9 with the 3-4 warps/SM that the
+  shared prefix allows, the base metric went from 4.5 ms to 11.4 ms and the
+  decimated phase from 26.9 ms to 40.0 ms.  Reverted; the GPU keeps
+  width-outer.
+- **bit-exact AVX-512.**  Done for the interpolation FMA loop, the amplitude
+  window de-interleave and the complex rotate.  The remaining candidates are
+  small or non-default: `block_sigma`'s copy+`fabs` pass (the `--sigma
+  measured` mode costs +0.4 s on a 1.45 s run, but that is the exact
+  quickselect median, not the copy), the `profile_boxcar_f32` tail/re-score
+  path (no tail at the default block size; re-scores only for candidates above
+  `exactcut`), the non-rational `--hidr` fallback, and the `datpipe`
+  power/normalise loops (33 ms/file: 20 ms FFTW `ESTIMATE` realfft, which is a
+  deliberate PRESTO-port choice, and 13 ms O(n) rednoise; in list mode both are
+  hidden by the two-producer prefetch pipeline).
+- **full-cache-line stores.**  `psT` was the only stream with partial-line
+  writes.
+- **cache blocking of the CPU gate** was measured: `CS_BC_BATCH` at 16, 32,
+  64, 128 and 256 gave 1.34-1.40 s on the heavy observation, i.e. no effect.
+  The base metric's `psT` (76 KB at B=128) already sits in L2, and the scan is
+  bound by the number of vector loads (nbins*nw per 16 profiles), not by
+  capacity, so shrinking the working set buys nothing.
+- **fusing the gate's prefix and scan** (replace `psT` with a wmax-deep ring
+  buffer) was analysed and, on the CPU, left undone for the same reason: a ring
+  moves the loads from L2 to L1 but does not reduce their count.
+- the same idea was implemented for the **GPU** `metric_kernel` (shared
+  19 KB -> 4 KB, occupancy ~4 -> ~25 CTAs/SM, scan fused into the prefix pass,
+  widths template-unrolled so there is no predication).  It is correct on all
+  105 files but **6% slower** (105-file list 5.37 s -> 5.72 s) and was
+  reverted: the width-outer scan walks two contiguous shared rows per width,
+  while the fused position-outer pass interleaves wmax+1 strided row accesses
+  per position.  This matches the earlier loop-interchange result, so the GPU
+  metric keeps width-outer.
+- **fusing the non-divisor decimated transforms on the GPU** (direct DFT of
+  the k=7,8,9,11,13,14,16 sub-spectra inside the metric kernel, as done for
+  the foldable ones) is the next GPU step: one kernel for all seven would cut
+  the decimated traffic from ~57 MB to ~33 MB per chunk (~5 ms per
+  observation).  A kernel per k would be *worse*, because each would re-read
+  the 488-byte trial row and the 32-byte sector granularity dominates for
+  Hk+1 <= 5 harmonics.
+- **removing redundant traffic.**  `fill_chunk_profiles` already zeroes only
+  the columns it does not write, the `.fft` reader is mmap-based, and applying
+  a zaplist costs nothing measurable (1.50 s with and without `--zaplist`).
+- **post-processing.**  Collapsing 1298 above-threshold candidates is not
+  measurable either (1.43-1.50 s with and without `--noremove
+  --noharmremove`).
+
+After these changes the remaining GPU kernels are at the memory-bandwidth
+limit (about 32 GB of traffic per 305 s observation), so further gains there
+need to remove passes, not reorder them.  All timing/profiling switches used
+during this work have been removed from the shipped build; the numbers above
+are from temporary instrumentation.
+
+### The prefetch pipeline
+
+(The former `-M/--batch` interleaved-batch drivers `coherent_search_list_m`
+and `prep_coherent_search_m` were removed: on the GPU they fell back to the
+one-file path anyway, and on the CPU they were slower at the default block
+size (four concurrent per-file working sets overflow the L2/L3 locality that
+the single-file driver enjoys), so they no longer justified the extra code.
+Their outputs were always byte-identical to the plain drivers'.)
+
+A few background producer threads read and prepare upcoming files (the
+in-memory realfft + rednoise for `.dat` inputs) while the main thread searches
+the current one.  With two producers and four slots the ~0.05 s/file
+preparation is fully hidden behind even a GPU search.  The pipeline runs
+whenever more than one input is searched; a process-wide FFTW planner mutex
+keeps the producers' plan creation safe against the search thread (plan
+execution remains parallel).
 
 ### Compiler tuning
 
@@ -771,7 +1051,8 @@ src/fileio.c                .inf / .fft readers
 src/interp.c                rational grid, phase/group tables, chunk filling,
                             harmonic-change boundaries, exact point kernel
 src/boxcar.c                medians, width banks, noise scales, scalar scan,
-                            AVX2 batched gate + fused prefix transpose
+                            AVX2/AVX-512 batched gate + fused 16-wide prefix
+                            transpose
 src/search.c                workspaces, FFTW plans, decimation, threaded chunk
                             loop, metric statistics, normalisation, wisdom
 src/candidate.c             candidate lists/collapsing, profile reconstruction,

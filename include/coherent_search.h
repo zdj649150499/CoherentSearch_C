@@ -233,7 +233,6 @@ typedef struct {
     int nbins;
     int wmax;
     int Nprof;
-    float *tile;   /* B*nbins */
     float *psT;    /* B*(nbins+wmax+1) */
     float *res;    /* B */
     float *mbuf;   /* B */
@@ -242,7 +241,6 @@ typedef struct {
 
 int  boxcar_batch_init(BoxcarBatch *bb, int nbins, int wmax, int Nprof);
 void boxcar_batch_free(BoxcarBatch *bb);
-void boxcar_gate_times(double *transpose, double *scan);
 
 float  profile_boxcar_f32(const float *profs, int j, float *psum,
                           const int *widths, int nw, int nbins,
@@ -318,7 +316,11 @@ typedef struct {
     void *bcsig;
     int sigcap;
     BoxcarBatch batch;
-    uint8_t *src; /* points at ftprofs (stride k handled by the plan) */
+    /* When nharms % k == 0 the c2r of the strided spectrum is exactly the
+     * k-fold average of the full-resolution profile (harmonic subsampling ==
+     * time-domain folding), so dprofs is produced by folding ws->profs. */
+    int fold;
+    int nbase;    /* bins in the full-resolution profile (2*nharms) */
 } DecimBuf;
 
 typedef struct {
@@ -343,7 +345,6 @@ typedef struct {
     float *re, *im;     /* de-interleaved amplitude planes */
     size_t planesize;
     uint8_t *filled;    /* nharms */
-    void *ftprofs_base; /* same as ftprofs (for clarity) */
 } Workspace;
 
 typedef struct {
@@ -364,6 +365,11 @@ typedef struct {
     long long nchunks;
     void *gpu_session;   /* GpuSession* when the CUDA backend is active */
     int wisdom_done;     /* FFTW wisdom imported/exported for this process */
+    /* sigma-sanity warning already reported for this observation geometry
+     * (the check result is identical for every DM of a sweep; report once) */
+    int sigma_warned;
+    double sigma_warn_T;
+    long long sigma_warn_namps;
 } SearchCache;
 
 void search_cache_free(SearchCache *cache);
@@ -378,6 +384,7 @@ void fill_chunk_profiles(Workspace *ws, const DirectPlanSet *dplans,
                          const FFTFile *ft, const SearchParams *p,
                          double rstart, double lodr, int n, long long t0);
 void transform_base(Workspace *ws);
+void fold_decims(Workspace *ws);
 void transform_decim(Workspace *ws, DecimBuf *db);
 int  direct_window_size(const SearchParams *p, int Nprof);
 
@@ -420,7 +427,7 @@ void fourier_interp_complex(double r, const float *amps, long long namps, int m,
 CandidateList search_file(const FFTFile *ft, const SearchParams *p,
                           double lofreq, double hifreq, int lobin, int blocksize,
                           double threshold, int remove, double dr_tol,
-                          int harm_remove, int numharm, int progress_mode,
+                          int harm_remove, int numharm,
                           MetricStats *metricstats, int normalize, int verbose,
                           int wisdom, const char *wisdom_file,
                           SearchCache *cache, double harm_tol,
@@ -441,7 +448,7 @@ int cs_gpu_session_matches(const GpuSession *s, const FFTFile *ft,
                            const SearchParams *p, int Nprof, long long total,
                            double r_lo, double lodr, int device);
 CandidateList cs_gpu_session_run(GpuSession *s, const FFTFile *ft,
-                                 double threshold, int progress_mode);
+                                 double threshold);
 void cs_gpu_session_free(GpuSession *s);
 
 CandidateList cs_gpu_search_region(const FFTFile *ft, const SearchParams *p,
@@ -449,7 +456,7 @@ CandidateList cs_gpu_search_region(const FFTFile *ft, const SearchParams *p,
                                    const long long *cstarts, long long total,
                                    int Nprof, long long nchunks,
                                    double r_lo, double r_hi, double lodr,
-                                   double threshold, int progress_mode,
+                                   double threshold,
                                    int device);
 
 void report_metricstats(const MetricStats *ms, const char *base,

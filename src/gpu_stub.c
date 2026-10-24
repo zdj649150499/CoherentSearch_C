@@ -32,9 +32,9 @@ int cs_gpu_session_matches(const GpuSession *s, const FFTFile *ft,
     return 0;
 }
 CandidateList cs_gpu_session_run(GpuSession *s, const FFTFile *ft,
-                                 double threshold, int progress_mode)
+                                 double threshold)
 {
-    (void)s; (void)ft; (void)threshold; (void)progress_mode;
+    (void)s; (void)ft; (void)threshold;
     CandidateList empty;
     candlist_init(&empty);
     return empty;
@@ -46,12 +46,12 @@ CandidateList cs_gpu_search_region(const FFTFile *ft, const SearchParams *p,
                                    const long long *cstarts, long long total,
                                    int Nprof, long long nchunks,
                                    double r_lo, double r_hi, double lodr,
-                                   double threshold, int progress_mode,
+                                   double threshold,
                                    int device)
 {
     (void)ft; (void)p; (void)dplans; (void)cstarts; (void)total;
     (void)Nprof; (void)nchunks; (void)r_lo; (void)r_hi; (void)lodr;
-    (void)threshold; (void)progress_mode; (void)device;
+    (void)threshold; (void)device;
     CandidateList empty;
     candlist_init(&empty);
     return empty;

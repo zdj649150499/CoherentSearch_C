@@ -352,6 +352,7 @@ int write_candidates(const CandidateList *cands, const char *outfile,
 {
     FILE *f = NULL;
     int to_stdout = (outfile == NULL || *outfile == '\0');
+    (void)threshold;
     if (to_stdout) f = stdout;
     else {
         f = fopen(outfile, "w");
@@ -370,12 +371,9 @@ int write_candidates(const CandidateList *cands, const char *outfile,
                 i + 1, c->metric, c->freq, 1000.0 / c->freq, c->nharm, dstr);
     } }
     if (to_stdout) {
-        char tbuf[64];
-        cs_format_double(tbuf, sizeof(tbuf), threshold);
-        fprintf(stderr, "# %zu candidates above threshold %s\n", cands->n, tbuf);
+        fflush(stdout);
     } else {
         fclose(f);
-        fprintf(stderr, "Info: Wrote candidates (n=%zu file=%s)\n", cands->n, outfile);
     }
     return 0;
 }

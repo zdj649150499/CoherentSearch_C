@@ -78,7 +78,6 @@ int prep_search_run(const char *outfile, int dmprecision,
         return -1;
     }
 
-    int progress = g_opts.noprogress ? 0 : 1;
     int rc = 0;
     int i;
     for (i = 0; i < ndms; i++) {
@@ -123,7 +122,7 @@ int prep_search_run(const char *outfile, int dmprecision,
         CandidateList cands = search_file(
             &ft, &p, g_opts.lofreq, g_opts.hifreq, g_opts.lobin, blocksize,
             g_opts.threshold, g_opts.remove, g_opts.drtol, g_opts.harm_remove,
-            g_opts.numharm, progress, NULL, 0, 0, g_opts.wisdom,
+            g_opts.numharm, NULL, 0, 0, g_opts.wisdom,
             g_opts.wisdomfile[0] ? g_opts.wisdomfile : NULL, &cache, 1.0,
             g_opts.gpu_device);
         candlist_sort_metric_desc(&cands);
@@ -139,7 +138,6 @@ int prep_search_run(const char *outfile, int dmprecision,
         candlist_free(&with_ducy);
         fftfile_close(&ft);
     }
-
     search_cache_free(&cache);
     datpipe_free(pipe);
     if (have_zap) zaplist_free(&zap);

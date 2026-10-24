@@ -1428,18 +1428,8 @@ static int get_data(float **outdata, int blocksperread,
 
 static void print_percent_complete(int current, int number)
 {
-    static int newper = 0, oldper = -1;
-
-    newper = (int) (current / (float) (number) * 100.0);
-    if (newper < 0)
-        newper = 0;
-    if (newper > 100)
-        newper = 100;
-    if (newper > oldper) {
-        printf("\rAmount complete = %3d%%", newper);
-        fflush(stdout);
-        oldper = newper;
-    }
+    (void)current;
+    (void)number;
 }
 
 

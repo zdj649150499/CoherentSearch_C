@@ -169,7 +169,8 @@ presto_gpu_cpu.o: presto_gpu_cpu.c $(PRESTO_INC)/presto_gpu_cpu.h
 	$(CC) -I$(PRESTO_INC) $(CPPFLAGS) $(PREP_CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(COMMON_OBJ) CoherentSearch.o list_main.o cuda.o gpu_stub.o \
+	rm -f $(COMMON_OBJ) CoherentSearch.o list_main.o \
+	      cuda.o gpu_stub.o \
 	      prep_search.o prep_cli.o prep_dedisp.o prep_main.o \
 	      $(addprefix presto_,$(addsuffix .o,$(PREP_C_SRCS))) presto_cuda.o \
 	      presto_gpu_cpu.o # $(BINLIST) $(BIN)

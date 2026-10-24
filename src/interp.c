@@ -432,7 +432,6 @@ static int fill_row_slow(Workspace *ws, const DirectPlan *dp, const FFTFile *ft,
     double hr_lo = (double)(dp->rfloor0 + dp->dr0);
     double dh = (double)h * lodr;
     const long long namps = ft->namps;
-    const int nh1 = p->nharms + 1;
     if (!(harmonic_fits(dp, ft, p, t0) && harmonic_fits(dp, ft, p, t0 + n - 1)))
         return 0;
     { int k; for (k = 0; k < n; k++) {
@@ -464,15 +463,146 @@ static int fill_row_slow(Workspace *ws, const DirectPlan *dp, const FFTFile *ft,
         }
         if (ws->is_f64) {
             double *dst = (double *)ws->ftprofs;
-            dst[2 * ((size_t)k * nh1 + h)] = xr;
-            dst[2 * ((size_t)k * nh1 + h) + 1] = xi;
+            dst[2 * ((size_t)h * ws->Nprof + k)] = xr;
+            dst[2 * ((size_t)h * ws->Nprof + k) + 1] = xi;
         } else {
             float *dst = (float *)ws->ftprofs;
-            dst[2 * ((size_t)k * nh1 + h)] = (float)xr;
-            dst[2 * ((size_t)k * nh1 + h) + 1] = (float)xi;
+            dst[2 * ((size_t)h * ws->Nprof + k)] = (float)xr;
+            dst[2 * ((size_t)h * ws->Nprof + k) + 1] = (float)xi;
         }
     } }
     return 1;
+}
+
+/* Copy one harmonic's amplitude window into the workspace's planar re/im
+ * buffers, zero-padding outside the stored spectrum.  Pure data movement. */
+static int fill_planes_f32(Workspace *ws, const FFTFile *ft,
+                           long long lo1, long long hi1, long long nw)
+{
+    const long long namps = ft->namps;
+    float *re = ws->re, *im = ws->im;
+    long long ihead = 1 - lo1;
+    if (ihead < 0) ihead = 0;
+    if (ihead > nw) ihead = nw;
+    long long itail = hi1 - namps;
+    if (itail < 0) itail = 0;
+    if (itail > nw - ihead) itail = nw - ihead;
+
+    { long long i; for (i = 0; i < ihead; i++) { re[i] = 0.0f; im[i] = 0.0f; } }
+    long long mid_end = nw - itail;
+    { long long i = ihead;
+#if defined(__AVX512F__)
+      /* De-interleave 16 complex at a time.  Pure data movement, so the
+       * planes hold exactly what the scalar copy produced. */
+      const __m512i ev = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14,
+                                           16, 18, 20, 22, 24, 26, 28, 30);
+      const __m512i od = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15,
+                                           17, 19, 21, 23, 25, 27, 29, 31);
+      for (; i + 16 <= mid_end; i += 16) {
+          const float *ap = ft->amps + 2 * (lo1 + i - 1);
+          __m512 a0 = _mm512_loadu_ps(ap);
+          __m512 a1 = _mm512_loadu_ps(ap + 16);
+          _mm512_storeu_ps(re + i, _mm512_permutex2var_ps(a0, ev, a1));
+          _mm512_storeu_ps(im + i, _mm512_permutex2var_ps(a0, od, a1));
+      }
+#endif
+      for (; i < mid_end; i++) {
+          long long idx = lo1 + i - 1; /* 0-based amplitude */
+          re[i] = ft->amps[2 * idx];
+          im[i] = ft->amps[2 * idx + 1];
+      } }
+    { long long i; for (i = mid_end; i < nw; i++) { re[i] = 0.0f; im[i] = 0.0f; } }
+    return 0;
+}
+
+/* Rotate the V accumulated complex values and store them into harmonic row h
+ * of the h-major spectrum buffer (element (h, j) at h*Nprof + j), so each call
+ * writes one contiguous run of V complex values.  Shared by the single-file
+ * and batched fillers so both use exactly the same arithmetic and stores. */
+static inline void row_store(Workspace *ws, int h, int nh1, long long j0, int V,
+                             const float *ar, const float *ai, int g,
+                             const float *gAr, const float *gAi, int n)
+{
+    float *ftf = (float *)ws->ftprofs;
+    double *ftd = (double *)ws->ftprofs;
+    const int Np = ws->Nprof;
+    int full = (j0 >= 0 && j0 + V <= n);
+    if (full) {
+        int k = 0;
+#if defined(__AVX512F__) && CS_DIRECT_GROUP_V == 32
+        if (!ws->is_f64) {
+            /* f32: rotate, interleave re/im across the whole register (a
+             * plain unpack works per 128-bit lane and would permute trials
+             * 4-7 with 8-11) and store 32 contiguous floats per pair. */
+            const __m512i ev = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19,
+                                                 4, 20, 5, 21, 6, 22, 7, 23);
+            const __m512i od = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27,
+                                                 12, 28, 13, 29, 14, 30, 15, 31);
+            for (; k + 16 <= V; k += 16) {
+                __m512 grv = _mm512_loadu_ps(gAr + (size_t)g * V + k);
+                __m512 giv = _mm512_loadu_ps(gAi + (size_t)g * V + k);
+                __m512 arv = _mm512_loadu_ps(ar + k);
+                __m512 aiv = _mm512_loadu_ps(ai + k);
+                __m512 xr = _mm512_sub_ps(_mm512_mul_ps(grv, arv),
+                                          _mm512_mul_ps(giv, aiv));
+                __m512 xi = _mm512_add_ps(_mm512_mul_ps(grv, aiv),
+                                          _mm512_mul_ps(giv, arv));
+                float *dst = ftf + 2 * ((size_t)h * Np + j0 + k);
+                _mm512_storeu_ps(dst, _mm512_permutex2var_ps(xr, ev, xi));
+                _mm512_storeu_ps(dst + 16, _mm512_permutex2var_ps(xr, od, xi));
+            }
+        } else {
+            /* f64: the products are formed in f32 and widened per element,
+             * exactly like the scalar tail (ftd[..] = (double)xr). */
+            const __m512i ev = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+            const __m512i od = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+            for (; k + 8 <= V; k += 8) {
+                __m256 grv = _mm256_loadu_ps(gAr + (size_t)g * V + k);
+                __m256 giv = _mm256_loadu_ps(gAi + (size_t)g * V + k);
+                __m256 arv = _mm256_loadu_ps(ar + k);
+                __m256 aiv = _mm256_loadu_ps(ai + k);
+                __m256 xr = _mm256_sub_ps(_mm256_mul_ps(grv, arv),
+                                          _mm256_mul_ps(giv, aiv));
+                __m256 xi = _mm256_add_ps(_mm256_mul_ps(grv, aiv),
+                                          _mm256_mul_ps(giv, arv));
+                __m512d xrd = _mm512_cvtps_pd(xr);
+                __m512d xid = _mm512_cvtps_pd(xi);
+                double *dst = ftd + 2 * ((size_t)h * Np + j0 + k);
+                _mm512_storeu_pd(dst, _mm512_permutex2var_pd(xrd, ev, xid));
+                _mm512_storeu_pd(dst + 8, _mm512_permutex2var_pd(xrd, od, xid));
+            }
+        }
+#endif
+        for (; k < V; k++) {
+            float gr = gAr[(size_t)g * V + k];
+            float gi = gAi[(size_t)g * V + k];
+            float xr = gr * ar[k] - gi * ai[k];
+            float xi = gr * ai[k] + gi * ar[k];
+            if (ws->is_f64) {
+                ftd[2 * ((size_t)h * Np + j0 + k)] = (double)xr;
+                ftd[2 * ((size_t)h * Np + j0 + k) + 1] = (double)xi;
+            } else {
+                ftf[2 * ((size_t)h * Np + j0 + k)] = xr;
+                ftf[2 * ((size_t)h * Np + j0 + k) + 1] = xi;
+            }
+        }
+    } else {
+        { int k; for (k = 0; k < V; k++) {
+            long long j = j0 + k;
+            if (j < 0 || j >= n) continue;
+            float gr = gAr[(size_t)g * V + k];
+            float gi = gAi[(size_t)g * V + k];
+            float xr = gr * ar[k] - gi * ai[k];
+            float xi = gr * ai[k] + gi * ar[k];
+            if (ws->is_f64) {
+                ftd[2 * ((size_t)h * Np + j)] = (double)xr;
+                ftd[2 * ((size_t)h * Np + j) + 1] = (double)xi;
+            } else {
+                ftf[2 * ((size_t)h * Np + j)] = xr;
+                ftf[2 * ((size_t)h * Np + j) + 1] = xi;
+            }
+        } }
+    }
 }
 
 static int fill_row_group(Workspace *ws, const DirectPlan *dp, const FFTFile *ft,
@@ -481,7 +611,6 @@ static int fill_row_group(Workspace *ws, const DirectPlan *dp, const FFTFile *ft
     const int h = dp->h, m = dp->m, m2 = m / 2;
     const int V = CS_DIRECT_GROUP_V;
     const int nh1 = p->nharms + 1;
-    const long long namps = ft->namps;
 
     if (!(harmonic_fits(dp, ft, p, t0) && harmonic_fits(dp, ft, p, t0 + n - 1)))
         return 0;
@@ -506,22 +635,8 @@ static int fill_row_group(Workspace *ws, const DirectPlan *dp, const FFTFile *ft
                 "%lld for a chunk of %d\n", ws->planesize, h, nw, n);
         return 0;
     }
+    if (fill_planes_f32(ws, ft, lo1, hi1, nw) != 0) return 0;
     float *re = ws->re, *im = ws->im;
-    long long ihead = 1 - lo1;
-    if (ihead < 0) ihead = 0;
-    if (ihead > nw) ihead = nw;
-    long long itail = hi1 - namps;
-    if (itail < 0) itail = 0;
-    if (itail > nw - ihead) itail = nw - ihead;
-
-    { long long i; for (i = 0; i < ihead; i++) { re[i] = 0.0f; im[i] = 0.0f; } }
-    long long mid_end = nw - itail;
-    { long long i; for (i = ihead; i < mid_end; i++) {
-        long long idx = lo1 + i - 1; /* 0-based amplitude */
-        re[i] = ft->amps[2 * idx];
-        im[i] = ft->amps[2 * idx + 1];
-    } }
-    { long long i; for (i = mid_end; i < nw; i++) { re[i] = 0.0f; im[i] = 0.0f; } }
 
     const float *gW = dp->gW;
     const float *gAr = dp->gA_re, *gAi = dp->gA_im;
@@ -529,32 +644,109 @@ static int fill_row_group(Workspace *ws, const DirectPlan *dp, const FFTFile *ft
     int res = res_e;
     long long qint = qint_e;
     long long T = T_first;
-    float *ftf = (float *)ws->ftprofs;
-    double *ftd = (double *)ws->ftprofs;
 
     while (T <= T_last) {
-        int g = (int)grow[res] - 1;
-        int pidx = (int)dp->row[res] - 1;
-        long long b0 = (long long)dp->rfloor0 + qint +
-                       (dp->carry[pidx] ? 1 : 0) + 2 - m2 - lo1;
-        size_t o = (size_t)goff[g];
-        int nj = (int)gnj[g];
-        long long j0 = T - t0;
+        /* Two groups per pass: the tap loop runs eight independent FMA
+         * chains instead of four, covering the 4-cycle FMA latency without
+         * extra passes over the weight rows.  Each group's FMA order is
+         * unchanged, so the results are bit-identical. */
+        long long T2 = T + V;
+        int have2 = (T2 <= T_last);
+
+        int gA = (int)grow[res] - 1;
+        int pidxA = (int)dp->row[res] - 1;
+        long long b0A = (long long)dp->rfloor0 + qint +
+                        (dp->carry[pidxA] ? 1 : 0) + 2 - m2 - lo1;
+        size_t oA = (size_t)goff[gA];
+        int njA = (int)gnj[gA];
+        long long j0A = T - t0;
+
+        int resB = res;
+        long long qintB = qint;
+        int gB = 0, njB = 0;
+        long long b0B = 0, j0B = 0;
+        size_t oB = 0;
+        if (have2) {
+            long long totB = (long long)res + (long long)V * dp->s;
+            qintB = qint + (long long)V * dp->base_adv + totB / dp->q;
+            resB = (int)(totB % dp->q);
+            gB = (int)grow[resB] - 1;
+            int pidxB = (int)dp->row[resB] - 1;
+            b0B = (long long)dp->rfloor0 + qintB +
+                  (dp->carry[pidxB] ? 1 : 0) + 2 - m2 - lo1;
+            oB = (size_t)goff[gB];
+            njB = (int)gnj[gB];
+            j0B = T2 - t0;
+        }
 
         float ar[CS_DIRECT_GROUP_V];
         float ai[CS_DIRECT_GROUP_V];
-#if defined(__AVX2__) && CS_DIRECT_GROUP_V == 32
-        /* Eight live 8-lane accumulators (4 ar + 4 ai): enough FMAs in flight
-         * to cover the 4-cycle FMA latency, which is the knee the Julia
-         * reference measured (DIRECT_GROUP_V). */
+        float ar2[CS_DIRECT_GROUP_V];
+        float ai2[CS_DIRECT_GROUP_V];
+#if defined(__AVX512F__) && CS_DIRECT_GROUP_V == 32
+        __m512 arA0 = _mm512_setzero_ps(), arA1 = _mm512_setzero_ps();
+        __m512 aiA0 = _mm512_setzero_ps(), aiA1 = _mm512_setzero_ps();
+        __m512 arB0 = _mm512_setzero_ps(), arB1 = _mm512_setzero_ps();
+        __m512 aiB0 = _mm512_setzero_ps(), aiB1 = _mm512_setzero_ps();
+        int njm = have2 ? (njA < njB ? njA : njB) : njA;
+        { int j; for (j = 0; j < njm; j++) {
+            __m512 rv = _mm512_set1_ps(re[b0A + j]);
+            __m512 iv = _mm512_set1_ps(im[b0A + j]);
+            const float *w = gW + oA + (size_t)j * V;
+            __m512 w0 = _mm512_loadu_ps(w + 0);
+            __m512 w1 = _mm512_loadu_ps(w + 16);
+            arA0 = _mm512_fmadd_ps(w0, rv, arA0);
+            arA1 = _mm512_fmadd_ps(w1, rv, arA1);
+            aiA0 = _mm512_fmadd_ps(w0, iv, aiA0);
+            aiA1 = _mm512_fmadd_ps(w1, iv, aiA1);
+            __m512 rv2 = _mm512_set1_ps(re[b0B + j]);
+            __m512 iv2 = _mm512_set1_ps(im[b0B + j]);
+            const float *w2 = gW + oB + (size_t)j * V;
+            __m512 u0 = _mm512_loadu_ps(w2 + 0);
+            __m512 u1 = _mm512_loadu_ps(w2 + 16);
+            arB0 = _mm512_fmadd_ps(u0, rv2, arB0);
+            arB1 = _mm512_fmadd_ps(u1, rv2, arB1);
+            aiB0 = _mm512_fmadd_ps(u0, iv2, aiB0);
+            aiB1 = _mm512_fmadd_ps(u1, iv2, aiB1);
+        } }
+        /* tail of the longer group (njA == njB for all but boundary groups) */
+        { int j; for (j = njm; j < njA; j++) {
+            __m512 rv = _mm512_set1_ps(re[b0A + j]);
+            __m512 iv = _mm512_set1_ps(im[b0A + j]);
+            const float *w = gW + oA + (size_t)j * V;
+            __m512 w0 = _mm512_loadu_ps(w + 0);
+            __m512 w1 = _mm512_loadu_ps(w + 16);
+            arA0 = _mm512_fmadd_ps(w0, rv, arA0);
+            arA1 = _mm512_fmadd_ps(w1, rv, arA1);
+            aiA0 = _mm512_fmadd_ps(w0, iv, aiA0);
+            aiA1 = _mm512_fmadd_ps(w1, iv, aiA1);
+        } }
+        if (have2) { int j; for (j = njm; j < njB; j++) {
+            __m512 rv = _mm512_set1_ps(re[b0B + j]);
+            __m512 iv = _mm512_set1_ps(im[b0B + j]);
+            const float *w = gW + oB + (size_t)j * V;
+            __m512 w0 = _mm512_loadu_ps(w + 0);
+            __m512 w1 = _mm512_loadu_ps(w + 16);
+            arB0 = _mm512_fmadd_ps(w0, rv, arB0);
+            arB1 = _mm512_fmadd_ps(w1, rv, arB1);
+            aiB0 = _mm512_fmadd_ps(w0, iv, aiB0);
+            aiB1 = _mm512_fmadd_ps(w1, iv, aiB1);
+        } }
+        _mm512_storeu_ps(ar + 0, arA0); _mm512_storeu_ps(ar + 16, arA1);
+        _mm512_storeu_ps(ai + 0, aiA0); _mm512_storeu_ps(ai + 16, aiA1);
+        if (have2) {
+            _mm512_storeu_ps(ar2 + 0, arB0); _mm512_storeu_ps(ar2 + 16, arB1);
+            _mm512_storeu_ps(ai2 + 0, aiB0); _mm512_storeu_ps(ai2 + 16, aiB1);
+        }
+#elif defined(__AVX2__) && CS_DIRECT_GROUP_V == 32
         __m256 ar0 = _mm256_setzero_ps(), ar1 = _mm256_setzero_ps();
         __m256 ar2 = _mm256_setzero_ps(), ar3 = _mm256_setzero_ps();
         __m256 ai0 = _mm256_setzero_ps(), ai1 = _mm256_setzero_ps();
         __m256 ai2 = _mm256_setzero_ps(), ai3 = _mm256_setzero_ps();
-        { int j; for (j = 0; j < nj; j++) {
-            __m256 rv = _mm256_set1_ps(re[b0 + j]);
-            __m256 iv = _mm256_set1_ps(im[b0 + j]);
-            const float *w = gW + o + (size_t)j * V;
+        { int j; for (j = 0; j < njA; j++) {
+            __m256 rv = _mm256_set1_ps(re[b0A + j]);
+            __m256 iv = _mm256_set1_ps(im[b0A + j]);
+            const float *w = gW + oA + (size_t)j * V;
             ar0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 0), rv, ar0);
             ar1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 8), rv, ar1);
             ar2 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 16), rv, ar2);
@@ -568,41 +760,65 @@ static int fill_row_group(Workspace *ws, const DirectPlan *dp, const FFTFile *ft
         _mm256_storeu_ps(ar + 16, ar2); _mm256_storeu_ps(ar + 24, ar3);
         _mm256_storeu_ps(ai + 0, ai0); _mm256_storeu_ps(ai + 8, ai1);
         _mm256_storeu_ps(ai + 16, ai2); _mm256_storeu_ps(ai + 24, ai3);
+        if (have2) {
+            __m256 br0 = _mm256_setzero_ps(), br1 = _mm256_setzero_ps();
+            __m256 br2 = _mm256_setzero_ps(), br3 = _mm256_setzero_ps();
+            __m256 bi0 = _mm256_setzero_ps(), bi1 = _mm256_setzero_ps();
+            __m256 bi2 = _mm256_setzero_ps(), bi3 = _mm256_setzero_ps();
+            { int j; for (j = 0; j < njB; j++) {
+                __m256 rv = _mm256_set1_ps(re[b0B + j]);
+                __m256 iv = _mm256_set1_ps(im[b0B + j]);
+                const float *w = gW + oB + (size_t)j * V;
+                br0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 0), rv, br0);
+                br1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 8), rv, br1);
+                br2 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 16), rv, br2);
+                br3 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 24), rv, br3);
+                bi0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 0), iv, bi0);
+                bi1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 8), iv, bi1);
+                bi2 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 16), iv, bi2);
+                bi3 = _mm256_fmadd_ps(_mm256_loadu_ps(w + 24), iv, bi3);
+            } }
+            _mm256_storeu_ps(ar2 + 0, br0); _mm256_storeu_ps(ar2 + 8, br1);
+            _mm256_storeu_ps(ar2 + 16, br2); _mm256_storeu_ps(ar2 + 24, br3);
+            _mm256_storeu_ps(ai2 + 0, bi0); _mm256_storeu_ps(ai2 + 8, bi1);
+            _mm256_storeu_ps(ai2 + 16, bi2); _mm256_storeu_ps(ai2 + 24, bi3);
+        }
 #else
         memset(ar, 0, sizeof(ar));
         memset(ai, 0, sizeof(ai));
-        { int j; for (j = 0; j < nj; j++) {
-            float rv = re[b0 + j];
-            float iv = im[b0 + j];
-            const float *w = gW + o + (size_t)j * V;
+        { int j; for (j = 0; j < njA; j++) {
+            float rv = re[b0A + j];
+            float iv = im[b0A + j];
+            const float *w = gW + oA + (size_t)j * V;
             { int k; for (k = 0; k < V; k++) {
                 ar[k] = fmaf(w[k], rv, ar[k]);
                 ai[k] = fmaf(w[k], iv, ai[k]);
             } }
         } }
+        if (have2) {
+            memset(ar2, 0, sizeof(ar2));
+            memset(ai2, 0, sizeof(ai2));
+            { int j; for (j = 0; j < njB; j++) {
+                float rv = re[b0B + j];
+                float iv = im[b0B + j];
+                const float *w = gW + oB + (size_t)j * V;
+                { int k; for (k = 0; k < V; k++) {
+                    ar2[k] = fmaf(w[k], rv, ar2[k]);
+                    ai2[k] = fmaf(w[k], iv, ai2[k]);
+                } }
+            } }
+        }
 #endif
 
-        int full = (j0 >= 0 && j0 + V <= n);
-        { int k; for (k = 0; k < V; k++) {
-            long long j = j0 + k;
-            if (!full && (j < 0 || j >= n)) continue;
-            float gr = gAr[(size_t)g * V + k];
-            float gi = gAi[(size_t)g * V + k];
-            float xr = gr * ar[k] - gi * ai[k];
-            float xi = gr * ai[k] + gi * ar[k];
-            if (ws->is_f64) {
-                ftd[2 * ((size_t)j * nh1 + h)] = (double)xr;
-                ftd[2 * ((size_t)j * nh1 + h) + 1] = (double)xi;
-            } else {
-                ftf[2 * ((size_t)j * nh1 + h)] = xr;
-                ftf[2 * ((size_t)j * nh1 + h) + 1] = xi;
-            }
-        } }
+        row_store(ws, h, nh1, j0A, V, ar, ai, gA, gAr, gAi, n);
+        if (have2)
+            row_store(ws, h, nh1, j0B, V, ar2, ai2, gB, gAr, gAi, n);
 
-        long long tot = (long long)res + (long long)V * dp->s;
-        qint += (long long)V * dp->base_adv + tot / dp->q;
+        long long step = have2 ? 2 : 1;
+        long long tot = (long long)res + (long long)step * V * dp->s;
+        qint += (long long)step * V * dp->base_adv + tot / dp->q;
         res = (int)(tot % dp->q);
-        T += V;
+        T += (long long)step * V;
     }
     return 1;
 }
@@ -615,49 +831,30 @@ int fill_harmonic_row(Workspace *ws, const DirectPlan *dp, const FFTFile *ft,
     return fill_row_group(ws, dp, ft, p, t0, n);
 }
 
+/* Zero one harmonic row (or the DC row, h = 0) of the h-major spectrum for
+ * trials [0, n): a single contiguous run per row. */
+static inline void zero_spec_row(Workspace *ws, int h, int n)
+{
+    char *base = (char *)ws->ftprofs;
+    size_t csz = ws->is_f64 ? 2 * sizeof(double) : 2 * sizeof(float);
+    memset(base + (size_t)h * ws->Nprof * csz, 0, (size_t)n * csz);
+}
+
 void fill_chunk_profiles(Workspace *ws, const DirectPlanSet *dplans,
                          const FFTFile *ft, const SearchParams *p,
                          double rstart, double lodr, int n, long long t0)
 {
     (void)rstart; (void)lodr;
-    const int nh1 = p->nharms + 1;
     /* Only the DC row and the harmonics that will NOT be filled need zeroing:
      * every filled harmonic writes all n columns, and columns >= n are never
      * read (the transforms and metrics only consume 0..n-1).  This replaces a
      * full (nharms+1)*Nprof memset per chunk. */
-    if (ws->is_f64) {
-        double *dst = (double *)ws->ftprofs;
-        { int j; for (j = 0; j < n; j++) {
-            dst[2 * ((size_t)j * nh1)] = 0.0;
-            dst[2 * ((size_t)j * nh1) + 1] = 0.0;
-        } }
-    } else {
-        float *dst = (float *)ws->ftprofs;
-        { int j; for (j = 0; j < n; j++) {
-            dst[2 * ((size_t)j * nh1)] = 0.0f;
-            dst[2 * ((size_t)j * nh1) + 1] = 0.0f;
-        } }
-    }
+    zero_spec_row(ws, 0, n);
     { int i; for (i = 0; i < dplans->n; i++) {
         const DirectPlan *dp = &dplans->plans[i];
         int fits = harmonic_fits(dp, ft, p, t0) &&
                    harmonic_fits(dp, ft, p, t0 + n - 1);
-        if (!fits) {
-            const int h = dp->h;
-            if (ws->is_f64) {
-                double *dst = (double *)ws->ftprofs;
-                { int j; for (j = 0; j < n; j++) {
-                    dst[2 * ((size_t)j * nh1 + h)] = 0.0;
-                    dst[2 * ((size_t)j * nh1 + h) + 1] = 0.0;
-                } }
-            } else {
-                float *dst = (float *)ws->ftprofs;
-                { int j; for (j = 0; j < n; j++) {
-                    dst[2 * ((size_t)j * nh1 + h)] = 0.0f;
-                    dst[2 * ((size_t)j * nh1 + h) + 1] = 0.0f;
-                } }
-            }
-        }
+        if (!fits) zero_spec_row(ws, dp->h, n);
         ws->filled[dp->h - 1] =
             (uint8_t)fill_harmonic_row(ws, dp, ft, p, t0, n);
     } }

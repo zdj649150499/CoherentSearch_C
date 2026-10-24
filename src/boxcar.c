@@ -4,7 +4,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
@@ -255,18 +254,6 @@ double profile_boxcar_f64(const double *profs, int j, double *psum,
 /* ------------------------------------------------------------------ */
 /* Batched gate                                                       */
 /* ------------------------------------------------------------------ */
-static _Thread_local double g_t_transpose, g_t_scan;
-static double gate_now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
-}
-void boxcar_gate_times(double *transpose, double *scan)
-{
-    *transpose = g_t_transpose;
-    *scan = g_t_scan;
-}
 int boxcar_batch_init(BoxcarBatch *bb, int nbins, int wmax, int Nprof)
 {
     memset(bb, 0, sizeof(*bb));
@@ -274,19 +261,18 @@ int boxcar_batch_init(BoxcarBatch *bb, int nbins, int wmax, int Nprof)
     bb->nbins = nbins;
     bb->wmax = wmax;
     bb->Nprof = Nprof;
-    bb->tile = (float *)malloc((size_t)bb->B * nbins * sizeof(float));
     bb->psT = (float *)malloc((size_t)bb->B * (nbins + wmax + 1) * sizeof(float));
     bb->res = (float *)malloc((size_t)bb->B * sizeof(float));
     bb->mbuf = (float *)malloc((size_t)bb->B * sizeof(float));
     bb->mvals = (double *)malloc((size_t)Nprof * sizeof(double));
-    if (!bb->tile || !bb->psT || !bb->res || !bb->mbuf || !bb->mvals) return -1;
+    if (!bb->psT || !bb->res || !bb->mbuf || !bb->mvals) return -1;
     return 0;
 }
 
 void boxcar_batch_free(BoxcarBatch *bb)
 {
     if (!bb) return;
-    free(bb->tile); free(bb->psT); free(bb->res); free(bb->mbuf); free(bb->mvals);
+    free(bb->psT); free(bb->res); free(bb->mbuf); free(bb->mvals);
     memset(bb, 0, sizeof(*bb));
 }
 
@@ -296,40 +282,214 @@ void boxcar_batch_free(BoxcarBatch *bb)
  * in a register, and writes the already-transposed prefix sums directly into
  * psT.  This removes the separate (B, nbins) tile entirely -- one write and one
  * read of ~61 KB per batch -- while producing bit-identical prefix sums to
- * `psum[i] = psum[i-1] + (col[idx] - 0)`. */
+ * `psum[i] = psum[i-1] + (col[idx] - 0)`.
+ *
+ * The lo/hi parameters restrict the fill to profile columns [lo, hi); the
+ * caller processes the batch in sub-tiles so the transposed prefix sums it is
+ * about to scan stay resident in L1D for the whole tile. */
 static void prefix_transpose_f32(float *psT, const float *profs, int j0,
-                                 int nbins, int wmax)
+                                 int nbins, int wmax, int blo, int bhi)
 {
     const int B = CS_BC_BATCH, BJ = CS_BC_TR_BJ;
 #if defined(__AVX2__)
-    { int b; for (b = 0; b < B; b += 8)
+    { int b; for (b = blo; b < bhi; b += 8)
         _mm256_storeu_ps(psT + b, _mm256_setzero_ps()); }
 #else
-    { int b; for (b = 0; b < B; b++) psT[b] = 0.0f; }
+    { int b; for (b = blo; b < bhi; b++) psT[b] = 0.0f; }
 #endif
-#if defined(__AVX2__) && BJ == 8
-    { int b0; for (b0 = 0; b0 < B; b0 += BJ) {
-        const float *s0 = profs + (size_t)(j0 + b0 + 0) * nbins;
-        const float *s1 = profs + (size_t)(j0 + b0 + 1) * nbins;
-        const float *s2 = profs + (size_t)(j0 + b0 + 2) * nbins;
-        const float *s3 = profs + (size_t)(j0 + b0 + 3) * nbins;
-        const float *s4 = profs + (size_t)(j0 + b0 + 4) * nbins;
-        const float *s5 = profs + (size_t)(j0 + b0 + 5) * nbins;
-        const float *s6 = profs + (size_t)(j0 + b0 + 6) * nbins;
-        const float *s7 = profs + (size_t)(j0 + b0 + 7) * nbins;
-        float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
-        float p4 = 0.f, p5 = 0.f, p6 = 0.f, p7 = 0.f;
-        { int i; for (i = 1; i <= nbins + wmax; i++) {
-            int idx = (i > nbins ? i - nbins : i) - 1;
-            p0 += s0[idx]; p1 += s1[idx]; p2 += s2[idx]; p3 += s3[idx];
-            p4 += s4[idx]; p5 += s5[idx]; p6 += s6[idx]; p7 += s7[idx];
-            float *dst = psT + (size_t)i * B + b0;
-            dst[0] = p0; dst[1] = p1; dst[2] = p2; dst[3] = p3;
-            dst[4] = p4; dst[5] = p5; dst[6] = p6; dst[7] = p7;
-        } }
+#if defined(__AVX512F__)
+    /* Two 8x8 register transposes (cheap unpack/shuffle/permute2f128 moves)
+     * joined with vinsertf32x8, so each prefix chain drives 16 profiles and
+     * every psT store is a full 64-byte line.  The prefix adds are the same
+     * adds in the same order, so psT is bit-identical to the 8-wide path. */
+#define CS_TR8_INTO(p0,p1,p2,p3,p4,p5,p6,p7, idx, out)                       \
+    do {                                                                     \
+        __m256 _t0 = _mm256_unpacklo_ps(_mm256_loadu_ps((p0) + (idx)),       \
+                                        _mm256_loadu_ps((p1) + (idx)));      \
+        __m256 _t1 = _mm256_unpackhi_ps(_mm256_loadu_ps((p0) + (idx)),       \
+                                        _mm256_loadu_ps((p1) + (idx)));      \
+        __m256 _t2 = _mm256_unpacklo_ps(_mm256_loadu_ps((p2) + (idx)),       \
+                                        _mm256_loadu_ps((p3) + (idx)));      \
+        __m256 _t3 = _mm256_unpackhi_ps(_mm256_loadu_ps((p2) + (idx)),       \
+                                        _mm256_loadu_ps((p3) + (idx)));      \
+        __m256 _t4 = _mm256_unpacklo_ps(_mm256_loadu_ps((p4) + (idx)),       \
+                                        _mm256_loadu_ps((p5) + (idx)));      \
+        __m256 _t5 = _mm256_unpackhi_ps(_mm256_loadu_ps((p4) + (idx)),       \
+                                        _mm256_loadu_ps((p5) + (idx)));      \
+        __m256 _t6 = _mm256_unpacklo_ps(_mm256_loadu_ps((p6) + (idx)),       \
+                                        _mm256_loadu_ps((p7) + (idx)));      \
+        __m256 _t7 = _mm256_unpackhi_ps(_mm256_loadu_ps((p6) + (idx)),       \
+                                        _mm256_loadu_ps((p7) + (idx)));      \
+        __m256 _u0 = _mm256_shuffle_ps(_t0, _t2, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u1 = _mm256_shuffle_ps(_t0, _t2, _MM_SHUFFLE(3, 2, 3, 2));  \
+        __m256 _u2 = _mm256_shuffle_ps(_t1, _t3, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u3 = _mm256_shuffle_ps(_t1, _t3, _MM_SHUFFLE(3, 2, 3, 2));  \
+        __m256 _u4 = _mm256_shuffle_ps(_t4, _t6, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u5 = _mm256_shuffle_ps(_t4, _t6, _MM_SHUFFLE(3, 2, 3, 2));  \
+        __m256 _u6 = _mm256_shuffle_ps(_t5, _t7, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u7 = _mm256_shuffle_ps(_t5, _t7, _MM_SHUFFLE(3, 2, 3, 2));  \
+        (out)[0] = _mm256_permute2f128_ps(_u0, _u4, 0x20);                   \
+        (out)[1] = _mm256_permute2f128_ps(_u1, _u5, 0x20);                   \
+        (out)[2] = _mm256_permute2f128_ps(_u2, _u6, 0x20);                   \
+        (out)[3] = _mm256_permute2f128_ps(_u3, _u7, 0x20);                   \
+        (out)[4] = _mm256_permute2f128_ps(_u0, _u4, 0x31);                   \
+        (out)[5] = _mm256_permute2f128_ps(_u1, _u5, 0x31);                   \
+        (out)[6] = _mm256_permute2f128_ps(_u2, _u6, 0x31);                   \
+        (out)[7] = _mm256_permute2f128_ps(_u3, _u7, 0x31);                   \
+    } while (0)
+    (void)BJ;
+    memset(psT + blo, 0, (size_t)(bhi - blo) * sizeof(float));
+    { int b0; for (b0 = blo; b0 < bhi; b0 += 16) {
+        const float *p0 = profs + (size_t)(j0 + b0 + 0) * nbins;
+        const float *p1 = profs + (size_t)(j0 + b0 + 1) * nbins;
+        const float *p2 = profs + (size_t)(j0 + b0 + 2) * nbins;
+        const float *p3 = profs + (size_t)(j0 + b0 + 3) * nbins;
+        const float *p4 = profs + (size_t)(j0 + b0 + 4) * nbins;
+        const float *p5 = profs + (size_t)(j0 + b0 + 5) * nbins;
+        const float *p6 = profs + (size_t)(j0 + b0 + 6) * nbins;
+        const float *p7 = profs + (size_t)(j0 + b0 + 7) * nbins;
+        const float *q0 = profs + (size_t)(j0 + b0 + 8) * nbins;
+        const float *q1 = profs + (size_t)(j0 + b0 + 9) * nbins;
+        const float *q2 = profs + (size_t)(j0 + b0 + 10) * nbins;
+        const float *q3 = profs + (size_t)(j0 + b0 + 11) * nbins;
+        const float *q4 = profs + (size_t)(j0 + b0 + 12) * nbins;
+        const float *q5 = profs + (size_t)(j0 + b0 + 13) * nbins;
+        const float *q6 = profs + (size_t)(j0 + b0 + 14) * nbins;
+        const float *q7 = profs + (size_t)(j0 + b0 + 15) * nbins;
+        __m512 acc = _mm512_setzero_ps();
+        int i = 1, idx = 0, seg, len;
+        for (seg = 0; seg < 2; seg++) {
+            len = seg ? wmax : nbins;
+            while (idx + 8 <= len) {
+                __m256 ca[8], cb[8];
+                CS_TR8_INTO(p0,p1,p2,p3,p4,p5,p6,p7, idx, ca);
+                CS_TR8_INTO(q0,q1,q2,q3,q4,q5,q6,q7, idx, cb);
+                { int k; for (k = 0; k < 8; k++) {
+                    __m512 v = _mm512_insertf32x8(
+                        _mm512_castps256_ps512(ca[k]), cb[k], 1);
+                    acc = _mm512_add_ps(acc, v);
+                    _mm512_storeu_ps(psT + (size_t)(i + k) * B + b0, acc);
+                } }
+                idx += 8;
+                i += 8;
+            }
+            for (; idx < len; idx++, i++) {
+                __m512 v = _mm512_setr_ps(p0[idx], p1[idx], p2[idx], p3[idx],
+                                          p4[idx], p5[idx], p6[idx], p7[idx],
+                                          q0[idx], q1[idx], q2[idx], q3[idx],
+                                          q4[idx], q5[idx], q6[idx], q7[idx]);
+                acc = _mm512_add_ps(acc, v);
+                _mm512_storeu_ps(psT + (size_t)i * B + b0, acc);
+            }
+            idx = 0;
+        }
     } }
+#undef CS_TR8_INTO
+#elif defined(__AVX2__) && BJ == 8
+    /* 8x8 register transpose: eight row loads cover eight positions for eight
+     * profiles, so the inner step costs 8 loads + 24 shuffles instead of 64
+     * loads.  Two profile octets run side by side so the serial prefix-add
+     * chain of one octet hides under the other's loads/shuffles.  The adds are
+     * the same adds in the same order, so the prefix sums are bit-identical. */
+#define CS_TR8_STEP(p0,p1,p2,p3,p4,p5,p6,p7, acc, idx, ii, boff)             \
+    do {                                                                     \
+        __m256 _t0 = _mm256_unpacklo_ps(_mm256_loadu_ps((p0) + (idx)),       \
+                                        _mm256_loadu_ps((p1) + (idx)));      \
+        __m256 _t1 = _mm256_unpackhi_ps(_mm256_loadu_ps((p0) + (idx)),       \
+                                        _mm256_loadu_ps((p1) + (idx)));      \
+        __m256 _t2 = _mm256_unpacklo_ps(_mm256_loadu_ps((p2) + (idx)),       \
+                                        _mm256_loadu_ps((p3) + (idx)));      \
+        __m256 _t3 = _mm256_unpackhi_ps(_mm256_loadu_ps((p2) + (idx)),       \
+                                        _mm256_loadu_ps((p3) + (idx)));      \
+        __m256 _t4 = _mm256_unpacklo_ps(_mm256_loadu_ps((p4) + (idx)),       \
+                                        _mm256_loadu_ps((p5) + (idx)));      \
+        __m256 _t5 = _mm256_unpackhi_ps(_mm256_loadu_ps((p4) + (idx)),       \
+                                        _mm256_loadu_ps((p5) + (idx)));      \
+        __m256 _t6 = _mm256_unpacklo_ps(_mm256_loadu_ps((p6) + (idx)),       \
+                                        _mm256_loadu_ps((p7) + (idx)));      \
+        __m256 _t7 = _mm256_unpackhi_ps(_mm256_loadu_ps((p6) + (idx)),       \
+                                        _mm256_loadu_ps((p7) + (idx)));      \
+        __m256 _u0 = _mm256_shuffle_ps(_t0, _t2, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u1 = _mm256_shuffle_ps(_t0, _t2, _MM_SHUFFLE(3, 2, 3, 2));  \
+        __m256 _u2 = _mm256_shuffle_ps(_t1, _t3, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u3 = _mm256_shuffle_ps(_t1, _t3, _MM_SHUFFLE(3, 2, 3, 2));  \
+        __m256 _u4 = _mm256_shuffle_ps(_t4, _t6, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u5 = _mm256_shuffle_ps(_t4, _t6, _MM_SHUFFLE(3, 2, 3, 2));  \
+        __m256 _u6 = _mm256_shuffle_ps(_t5, _t7, _MM_SHUFFLE(1, 0, 1, 0));  \
+        __m256 _u7 = _mm256_shuffle_ps(_t5, _t7, _MM_SHUFFLE(3, 2, 3, 2));  \
+        __m256 _c0 = _mm256_permute2f128_ps(_u0, _u4, 0x20);                 \
+        __m256 _c1 = _mm256_permute2f128_ps(_u1, _u5, 0x20);                 \
+        __m256 _c2 = _mm256_permute2f128_ps(_u2, _u6, 0x20);                 \
+        __m256 _c3 = _mm256_permute2f128_ps(_u3, _u7, 0x20);                 \
+        __m256 _c4 = _mm256_permute2f128_ps(_u0, _u4, 0x31);                 \
+        __m256 _c5 = _mm256_permute2f128_ps(_u1, _u5, 0x31);                 \
+        __m256 _c6 = _mm256_permute2f128_ps(_u2, _u6, 0x31);                 \
+        __m256 _c7 = _mm256_permute2f128_ps(_u3, _u7, 0x31);                 \
+        acc = _mm256_add_ps(acc, _c0);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 0) * B + (boff), acc);        \
+        acc = _mm256_add_ps(acc, _c1);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 1) * B + (boff), acc);        \
+        acc = _mm256_add_ps(acc, _c2);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 2) * B + (boff), acc);        \
+        acc = _mm256_add_ps(acc, _c3);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 3) * B + (boff), acc);        \
+        acc = _mm256_add_ps(acc, _c4);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 4) * B + (boff), acc);        \
+        acc = _mm256_add_ps(acc, _c5);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 5) * B + (boff), acc);        \
+        acc = _mm256_add_ps(acc, _c6);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 6) * B + (boff), acc);        \
+        acc = _mm256_add_ps(acc, _c7);                                       \
+        _mm256_storeu_ps(psT + (size_t)((ii) + 7) * B + (boff), acc);        \
+    } while (0)
+
+    { int b0; for (b0 = blo; b0 < bhi; b0 += 2 * BJ) {
+        const float *p0 = profs + (size_t)(j0 + b0 + 0) * nbins;
+        const float *p1 = profs + (size_t)(j0 + b0 + 1) * nbins;
+        const float *p2 = profs + (size_t)(j0 + b0 + 2) * nbins;
+        const float *p3 = profs + (size_t)(j0 + b0 + 3) * nbins;
+        const float *p4 = profs + (size_t)(j0 + b0 + 4) * nbins;
+        const float *p5 = profs + (size_t)(j0 + b0 + 5) * nbins;
+        const float *p6 = profs + (size_t)(j0 + b0 + 6) * nbins;
+        const float *p7 = profs + (size_t)(j0 + b0 + 7) * nbins;
+        const float *q0 = profs + (size_t)(j0 + b0 + 8) * nbins;
+        const float *q1 = profs + (size_t)(j0 + b0 + 9) * nbins;
+        const float *q2 = profs + (size_t)(j0 + b0 + 10) * nbins;
+        const float *q3 = profs + (size_t)(j0 + b0 + 11) * nbins;
+        const float *q4 = profs + (size_t)(j0 + b0 + 12) * nbins;
+        const float *q5 = profs + (size_t)(j0 + b0 + 13) * nbins;
+        const float *q6 = profs + (size_t)(j0 + b0 + 14) * nbins;
+        const float *q7 = profs + (size_t)(j0 + b0 + 15) * nbins;
+        __m256 acca = _mm256_setzero_ps();
+        __m256 accb = _mm256_setzero_ps();
+        int i = 1;             /* psT row being written */
+        int idx = 0;           /* profile bin being read */
+        int seg, len;
+        for (seg = 0; seg < 2; seg++) {
+            len = seg ? wmax : nbins;
+            while (idx + 8 <= len) {
+                CS_TR8_STEP(p0,p1,p2,p3,p4,p5,p6,p7, acca, idx, i, b0);
+                CS_TR8_STEP(q0,q1,q2,q3,q4,q5,q6,q7, accb, idx, i, b0 + 8);
+                idx += 8;
+                i += 8;
+            }
+            for (; idx < len; idx++, i++) {
+                __m256 va = _mm256_setr_ps(p0[idx], p1[idx], p2[idx], p3[idx],
+                                           p4[idx], p5[idx], p6[idx], p7[idx]);
+                __m256 vb = _mm256_setr_ps(q0[idx], q1[idx], q2[idx], q3[idx],
+                                           q4[idx], q5[idx], q6[idx], q7[idx]);
+                acca = _mm256_add_ps(acca, va);
+                _mm256_storeu_ps(psT + (size_t)i * B + b0, acca);
+                accb = _mm256_add_ps(accb, vb);
+                _mm256_storeu_ps(psT + (size_t)i * B + b0 + 8, accb);
+            }
+            idx = 0;
+        }
+    } }
+#undef CS_TR8_STEP
+
 #else
-    { int b0; for (b0 = 0; b0 < B; b0 += BJ) {
+    { int b0; for (b0 = blo; b0 < bhi; b0 += BJ) {
         const float *src[CS_BC_TR_BJ];
         { int b; for (b = 0; b < BJ; b++) src[b] = profs + (size_t)(j0 + b0 + b) * nbins; }
         float acc[CS_BC_TR_BJ];
@@ -346,16 +506,16 @@ static void prefix_transpose_f32(float *psT, const float *profs, int j0,
 #endif
 }
 static void prefix_transpose_f64(float *psT, const double *profs, int j0,
-                                 int nbins, int wmax)
+                                 int nbins, int wmax, int blo, int bhi)
 {
     const int B = CS_BC_BATCH, BJ = CS_BC_TR_BJ;
 #if defined(__AVX2__)
-    { int b; for (b = 0; b < B; b += 8)
+    { int b; for (b = blo; b < bhi; b += 8)
         _mm256_storeu_ps(psT + b, _mm256_setzero_ps()); }
 #else
-    { int b; for (b = 0; b < B; b++) psT[b] = 0.0f; }
+    { int b; for (b = blo; b < bhi; b++) psT[b] = 0.0f; }
 #endif
-    { int b0; for (b0 = 0; b0 < B; b0 += BJ) {
+    { int b0; for (b0 = blo; b0 < bhi; b0 += BJ) {
         const double *src[CS_BC_TR_BJ];
         { int b; for (b = 0; b < BJ; b++) src[b] = profs + (size_t)(j0 + b0 + b) * nbins; }
         float acc[CS_BC_TR_BJ];
@@ -372,37 +532,67 @@ static void prefix_transpose_f64(float *psT, const double *profs, int j0,
 }
 
 static void scan_batch(BoxcarBatch *bb, const int *widths, int nw, int nbins,
-                       float invsigma, const double *shape)
+                       float invsigma, const double *shape, int blo, int bhi)
 {
     const int B = bb->B;
-    float *tile = bb->tile, *psT = bb->psT, *res = bb->res, *mbuf = bb->mbuf;
+    float *psT = bb->psT, *res = bb->res, *mbuf = bb->mbuf;
     int wmax = bb->wmax;
 #if defined(__AVX512F__)
-    /* 16 profiles per vector.  B=128 is a multiple of 16, so no tails. */
-    (void)tile; (void)wmax;
-    { int b; for (b = 0; b < B; b += 16)
-        _mm512_storeu_ps(res + b, _mm512_set1_ps(-INFINITY)); }
+    /* 16 profiles per vector.  B=128 is a multiple of 16, so no tails.
+     *
+     * Positions are the outer loop: psT[p-1] is loaded once and reused by
+     * every ladder width, so this reads (1+nw) vectors per position instead
+     * of 2*nw.  Max is exact and order-free, so the result is unchanged. */
+    (void)wmax;
     int to = nbins * B;
+    if (nw <= 12) {
+        int wo[12];
+        { int i; for (i = 0; i < nw; i++) wo[i] = widths[i] * B; }
+        { int b; for (b = blo; b < bhi; b += 16) {
+            __m512 mx[12];
+            { int i; for (i = 0; i < nw; i++) mx[i] = _mm512_set1_ps(-INFINITY); }
+            { int p; for (p = 1; p <= nbins; p++) {
+                int o = (p - 1) * B;
+                __m512 base = _mm512_loadu_ps(psT + o + b);
+                { int i; for (i = 0; i < nw; i++)
+                    mx[i] = _mm512_max_ps(mx[i],
+                        _mm512_sub_ps(_mm512_loadu_ps(psT + o + wo[i] + b), base)); }
+            } }
+            { __m512 st = _mm512_sub_ps(_mm512_loadu_ps(psT + to + b),
+                                        _mm512_loadu_ps(psT + b));
+              __m512 r = _mm512_set1_ps(-INFINITY);
+              { int i; for (i = 0; i < nw; i++) {
+                  __m512 duty = _mm512_set1_ps((float)widths[i] / (float)nbins);
+                  __m512 invsw = _mm512_set1_ps((float)((double)invsigma * shape[i]));
+                  r = _mm512_max_ps(r, _mm512_mul_ps(
+                          _mm512_sub_ps(mx[i], _mm512_mul_ps(duty, st)), invsw));
+              } }
+              _mm512_storeu_ps(res + b, r); }
+        } }
+        return;
+    }
+    { int b; for (b = blo; b < bhi; b += 16)
+        _mm512_storeu_ps(res + b, _mm512_set1_ps(-INFINITY)); }
     { int i; for (i = 0; i < nw; i++) {
         int w = widths[i];
         __m512 duty = _mm512_set1_ps((float)w / (float)nbins);
         __m512 invsw = _mm512_set1_ps((float)((double)invsigma * shape[i]));
         int wo = w * B;
-        { int b; for (b = 0; b < B; b += 16) {
+        { int b; for (b = blo; b < bhi; b += 16) {
             __m512 x = _mm512_sub_ps(_mm512_loadu_ps(psT + wo + b),
                                      _mm512_loadu_ps(psT + b));
             _mm512_storeu_ps(mbuf + b, x);
         } }
         { int p; for (p = 2; p <= nbins; p++) {
             int o = (p - 1) * B;
-            { int b; for (b = 0; b < B; b += 16) {
+            { int b; for (b = blo; b < bhi; b += 16) {
                 __m512 x = _mm512_sub_ps(_mm512_loadu_ps(psT + o + wo + b),
                                          _mm512_loadu_ps(psT + o + b));
                 __m512 m = _mm512_loadu_ps(mbuf + b);
                 _mm512_storeu_ps(mbuf + b, _mm512_max_ps(m, x));
             } }
         } }
-        { int b; for (b = 0; b < B; b += 16) {
+        { int b; for (b = blo; b < bhi; b += 16) {
             __m512 st = _mm512_sub_ps(_mm512_loadu_ps(psT + to + b),
                                       _mm512_loadu_ps(psT + b));
             __m512 c = _mm512_mul_ps(
@@ -417,8 +607,8 @@ static void scan_batch(BoxcarBatch *bb, const int *widths, int nw, int nbins,
      * than this explicit form: it versions every width iteration for aliasing
      * and never keeps the max in a register across the phase loop.  B is a
      * multiple of 8, so the vector loops need no tails. */
-    (void)tile; (void)wmax;
-    { int b; for (b = 0; b < B; b += 8)
+    (void)wmax;
+    { int b; for (b = blo; b < bhi; b += 8)
         _mm256_storeu_ps(res + b, _mm256_set1_ps(-INFINITY)); }
     int to = nbins * B;
     { int i; for (i = 0; i < nw; i++) {
@@ -426,21 +616,21 @@ static void scan_batch(BoxcarBatch *bb, const int *widths, int nw, int nbins,
         __m256 duty = _mm256_set1_ps((float)w / (float)nbins);
         __m256 invsw = _mm256_set1_ps((float)((double)invsigma * shape[i]));
         int wo = w * B;
-        { int b; for (b = 0; b < B; b += 8) {
+        { int b; for (b = blo; b < bhi; b += 8) {
             __m256 x = _mm256_sub_ps(_mm256_loadu_ps(psT + wo + b),
                                      _mm256_loadu_ps(psT + b));
             _mm256_storeu_ps(mbuf + b, x);
         } }
         { int p; for (p = 2; p <= nbins; p++) {
             int o = (p - 1) * B;
-            { int b; for (b = 0; b < B; b += 8) {
+            { int b; for (b = blo; b < bhi; b += 8) {
                 __m256 x = _mm256_sub_ps(_mm256_loadu_ps(psT + o + wo + b),
                                          _mm256_loadu_ps(psT + o + b));
                 __m256 m = _mm256_loadu_ps(mbuf + b);
                 _mm256_storeu_ps(mbuf + b, _mm256_max_ps(m, x));
             } }
         } }
-        { int b; for (b = 0; b < B; b += 8) {
+        { int b; for (b = blo; b < bhi; b += 8) {
             __m256 st = _mm256_sub_ps(_mm256_loadu_ps(psT + to + b),
                                       _mm256_loadu_ps(psT + b));
             __m256 c = _mm256_mul_ps(
@@ -451,23 +641,23 @@ static void scan_batch(BoxcarBatch *bb, const int *widths, int nw, int nbins,
         } }
     } }
 #else
-    (void)tile; (void)wmax;
-    { int b; for (b = 0; b < B; b++) res[b] = -INFINITY; }
+    (void)wmax;
+    { int b; for (b = blo; b < bhi; b++) res[b] = -INFINITY; }
     int to = nbins * B;
     { int i; for (i = 0; i < nw; i++) {
         int w = widths[i];
         float duty = (float)w / (float)nbins;
         float invsw = (float)((double)invsigma * shape[i]);
         int wo = w * B;
-        { int b; for (b = 0; b < B; b++) mbuf[b] = psT[wo + b] - psT[b]; }
+        { int b; for (b = blo; b < bhi; b++) mbuf[b] = psT[wo + b] - psT[b]; }
         { int p; for (p = 2; p <= nbins; p++) {
             int o = (p - 1) * B;
-            { int b; for (b = 0; b < B; b++) {
+            { int b; for (b = blo; b < bhi; b++) {
                 float d = psT[o + wo + b] - psT[o + b];
                 if (d > mbuf[b]) mbuf[b] = d;
             } }
         } }
-        { int b; for (b = 0; b < B; b++) {
+        { int b; for (b = blo; b < bhi; b++) {
             float c = (mbuf[b] - duty * (psT[to + b] - psT[b])) * invsw;
             if (c > res[b]) res[b] = c;
         } }
@@ -475,6 +665,11 @@ static void scan_batch(BoxcarBatch *bb, const int *widths, int nw, int nbins,
 #endif
 }
 
+/* Sub-tile width for the batched gate: (nbins+wmax+1) x 32 floats of psT
+ * (~17 KB for the full-resolution profile) plus the 32 source columns stay
+ * resident in L1D while prefix and scan run, instead of streaming the whole
+ * 128-profile batch (65+ KB) through L1D for every ladder width. */
+#define CS_BC_TILE 32
 #define DEFINE_GATE(T, SUFFIX, PREFIX, SCALAR)                             \
 static void gate_##SUFFIX(BoxcarBatch *bb, const T *profs, int n, T *psum,    \
                           const int *widths, int nw, int nbins,               \
@@ -483,12 +678,11 @@ static void gate_##SUFFIX(BoxcarBatch *bb, const T *profs, int n, T *psum,    \
     const int B = bb->B;                                                      \
     int j0 = 0;                                                               \
     while (j0 + B <= n) {                                                     \
-        double _tt = gate_now();                                              \
-        PREFIX(bb->psT, profs, j0, nbins, bb->wmax);                          \
-        g_t_transpose += gate_now() - _tt;                                    \
-        _tt = gate_now();                                                     \
-        scan_batch(bb, widths, nw, nbins, (float)invsigma, shape);            \
-        g_t_scan += gate_now() - _tt;                                         \
+        { int t; for (t = 0; t < B; t += CS_BC_TILE) {                        \
+            PREFIX(bb->psT, profs, j0, nbins, bb->wmax, t, t + CS_BC_TILE);   \
+            scan_batch(bb, widths, nw, nbins, (float)invsigma, shape,         \
+                       t, t + CS_BC_TILE);                                    \
+        } }                                                                   \
         { int b; for (b = 0; b < B; b++) bb->mvals[j0 + b] = (double)bb->res[b]; }   \
         j0 += B;                                                              \
     }                                                                         \
@@ -510,12 +704,12 @@ void boxcar_metrics_f32(BoxcarBatch *bb, const float *profs, int n, float *psum,
                                                       nbins, invsigma, shape); }
         return;
     }
+    /* The f32 batched gate is bit-identical to profile_boxcar_f32 (same
+     * prefix-sum and scan expressions on the same values -- verified
+     * exhaustively against the scalar path), so no post-gate re-scan is
+     * needed for the candidates it lets through.  The f64 gate below keeps
+     * its re-scan: it accumulates through a float psT and is approximate. */
     gate_f32(bb, profs, n, psum, widths, nw, nbins, invsigma, shape);
-    { int j; for (j = 0; j < n; j++) {
-        if (bb->mvals[j] < exactcut) continue;
-        bb->mvals[j] = (double)profile_boxcar_f32(profs, j, psum, widths, nw,
-                                                  nbins, invsigma, shape);
-    } }
 }
 
 void boxcar_metrics_f64(BoxcarBatch *bb, const double *profs, int n, double *psum,
